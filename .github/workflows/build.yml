@@ -1870,6 +1870,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # ★ 必须在 `cd` 进 schat.build 的克隆之前取：那之后 `git rev-parse HEAD`
+          #   说的就是对面那个仓库了，传过去必然 `not our ref`。
+          SRC_SHA="$(git rev-parse HEAD)"
           if [ -z "${SCHAT_TOKEN:-}" ] || [ -z "${SCHAT_REPO:-}" ]; then
             echo "::warning::SCHAT_BUILD_TOKEN/REPO 未配置，跳过 macOS 签名构建触发"
             exit 0
@@ -1888,7 +1891,7 @@ jobs:
           make_trigger_commit() {
             git commit --allow-empty -m "trigger: clashauto macOS (swift + qt)" \
               -m "source-repo: ${SOURCE_REPO}" \
-              -m "source-sha: $(git rev-parse HEAD)" \
+              -m "source-sha: ${SRC_SHA}" \
               -m "source-ref: ${SOURCE_REF}" \
               -m "product: coast-swift" \
               -m "product: coast-qt" \
@@ -1925,7 +1928,7 @@ jobs:
             make_trigger_commit
           done
           echo "已触发签名构建 → ${SCHAT_REPO}@${branch}"
-          echo "  源: ${SOURCE_REPO}@$(git rev-parse HEAD) (${SOURCE_REF})"
+          echo "  源: ${SOURCE_REPO}@${SRC_SHA} (${SOURCE_REF})"
           echo "  目标 release: ${TARGET_TAG} (prerelease=${TARGET_PRERELEASE})"
           echo "  产品线: coast-swift（…-macos-universal.dmg）+ coast-qt（…-macos-universal-qt.dmg）"
 
