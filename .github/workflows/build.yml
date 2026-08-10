@@ -725,14 +725,14 @@ jobs:
             dist/Coast-*-windows-${{ matrix.arch }}-setup.exe
 
       - name: Write release notes
-        if: github.event_name == 'push'
+        if: (github.event.inputs.publish || github.event.client_payload.publish || 'true') != 'false'
         shell: bash
         env:
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: printf '%s\n' "$COMMIT_MSG" > release-notes.md
 
       - name: Upload to GitHub Release
-        if: github.event_name == 'push'
+        if: (github.event.inputs.publish || github.event.client_payload.publish || 'true') != 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -1625,14 +1625,14 @@ jobs:
             dist/Coast-*-linux-${{ matrix.arch }}.deb
 
       - name: Write release notes
-        if: github.event_name == 'push'
+        if: (github.event.inputs.publish || github.event.client_payload.publish || 'true') != 'false'
         shell: bash
         env:
           COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: printf '%s\n' "$COMMIT_MSG" > release-notes.md
 
       - name: Upload to GitHub Release
-        if: github.event_name == 'push'
+        if: (github.event.inputs.publish || github.event.client_payload.publish || 'true') != 'false'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG }}
@@ -1673,7 +1673,7 @@ jobs:
   manifest:
     name: Update version.json manifest
     needs: [windows, linux]
-    if: github.event_name == 'push'
+    if: (github.event.inputs.publish || github.event.client_payload.publish || 'true') != 'false'
     runs-on: ubuntu-latest
     # 同一分支上连着推两次时，两个 run 会同时「读旧清单 → 改 → 传」，后写的那个会把先写的
     # 盖掉（读改写没有原子性）。串行化，且**不取消**排队中的那个 —— 取消等于丢一次更新。
@@ -1760,7 +1760,7 @@ jobs:
   gateway-selftest:
     name: NDP RA parse self-test (Linux)
     needs: [linux]
-    if: github.event_name == 'push'
+    if: (github.event.inputs.publish || github.event.client_payload.publish || 'true') != 'false'
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout
@@ -1824,7 +1824,7 @@ jobs:
     # checkout 同一个 sha 从头构建，本仓库的构建结果不是它的输入；挂上依赖只会让
     # 「Swift 编译挂了 → Qt 包也发不出来」这种无关耦合成立。
     needs: [windows]
-    if: github.event_name == 'push'
+    if: (github.event.inputs.publish || github.event.client_payload.publish || 'true') != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
