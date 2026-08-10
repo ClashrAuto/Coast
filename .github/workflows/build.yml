@@ -98,6 +98,13 @@ jobs:
       # 而开发机上完全看不出来（开发者用的就是中文）。第一次跑就找出 3 条漏译。
       # 放在这条腿上：纯 Python，不需要任何构建产物，几秒钟出结果。
       - run: python3 clashauto-c++/scripts/i18n_check.py
+      # ★ 定位器（Row/Column/Grid/Flow）的**直接子项**写了被禁的 anchors。Qt 的反应不是
+      #   忽略那一条，而是让**整个定位器停止排版**（"Row will not function"）：子项全部
+      #   堆到原点，而且那条 anchors 自身也不生效 —— MouseArea 会变成 0×0，那块**点不动**。
+      #   构建期零信号；运行期只有该组件真被实例化时才打一行警告，开发机上很容易一直看不见。
+      #   2026-08-10 实测：出货的 v1.0.1143 里 ConfirmOverlay 的「5 分钟内不再询问」勾选框
+      #   就是这样既错位又点不动的，是从 validate 的无头运行日志里翻出来的。
+      - run: python3 clashauto-c++/scripts/qml_positioner_check.py clashauto-c++/qml clashauto-c++/installer/ui/qml
       # 安装器原生侧那张语言表（25 句 × 13 语言 = 325 格）是**生成物**。生成物的经典
       # 隐患是有人直接手改产物：改动能编、能跑、能过自检，然后下一次跑生成器时被
       # **静默还原** —— 而那时改的人早忘了这回事，只会看到「我明明改过的文案又变回去了」。
