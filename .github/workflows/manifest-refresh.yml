@@ -1,0 +1,134 @@
+# ⚠️ **本文件是生成的，别直接改。**
+#
+# 源在 ClashrAuto/clashauto 的 `.github/workflows/manifest-refresh.yml`，
+# 生成器是那边的 `.github/scripts/gen_coast_workflow.py`（与 build.yml 同一次生成）。
+#
+# 为什么它必须住在**这里**而不是源仓库：清单（固定 tag `version` 的 release 资源）现在
+# 发在本仓库名下，而这个工作流是由 schat.build 传完签名 DMG 之后当场 workflow_dispatch
+# 触发的 —— dispatch 只能打到清单所在的仓库，且**只认默认分支上的工作流文件**。
+
+name: Refresh version.json
+
+# 补 macOS 那两条 DMG。
+#
+# 本仓库的 CI 只发 Windows/Linux；两个 macOS DMG 由外部签名仓库 integemjack/schat.build
+# **异步**追加到同一个 release 上，晚几分钟到几小时都正常。build.yml 里的 manifest job
+# 跑在它们到达之前，所以清单里那两条会先沿用上一版。
+#
+# ★ 由**打包方在传完包之后当场触发**（2026-08-09 起）。GitHub 不会为「往已有 release 传
+#   资源」发事件（release 事件只在创建/编辑 release 本身时触发），所以这一步只能由知道
+#   「我刚传完」的那一方发起 —— 也就是 schat.build 的 clashauto-mac.yml /
+#   clashauto-mac-qt.yml，它们在 gh release upload 之后 workflow_dispatch 本工作流。
+#
+#   原来这里挂的是 `*/30 * * * *`：无论有没有新包，一天 48 次空转，而清单真正需要更新的
+#   时刻一年也没几次；代价还不止是机时 —— 每半小时一条 workflow run，把这个仓库的
+#   Actions 历史刷成噪声，真正的发布轮次淹在里面。轮询能换来的只有「晚最多 30 分钟」，
+#   而触发式是**秒级**且精确。
+#
+# ⚠️ workflow_dispatch 只认**默认分支**上的工作流文件。改动合进 main 之前，
+#    外部触发会以 404 收场。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # 与 release.yml 的 manifest job **同一个组**：两边都是「读旧清单 → 改 → 传」，
+  # 没有原子性，并发跑就会互相盖掉。不取消排队中的那个 —— 取消等于丢一次更新。
+  group: version-manifest
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    name: Refresh version.json
+    runs-on: ubuntu-latest
+    steps:
+      # ★ 检出的是**源仓库** —— 本仓库没有 .github/scripts/ 下那个脚本。
+      #   其余步骤照旧按 GITHUB_REPOSITORY（= 本仓库）读写清单。
+      - name: Checkout clashauto（脚本在源仓库）
+        uses: actions/checkout@v4
+        with:
+          repository: ClashrAuto/clashauto
+          ref: master
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+
+      - name: Self-test manifest merge
+        run: python3 .github/scripts/build_version_manifest.py --selftest
+
+      - name: Fetch current manifest
+        id: prev
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! curl -fsSL --max-time 60 -o version.json \
+                 "https://github.com/${GITHUB_REPOSITORY}/releases/download/version/version.json"; then
+            # 还没有清单可刷 —— 等 release.yml 先发一份出来。不是错误。
+            echo "没有清单，跳过本次刷新"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for ch in release prerelease; do
+            tag="$(python3 -c "import json;print((json.load(open('version.json')).get('releases') or {}).get('$ch',{}).get('tag',''))")"
+            # ★ 引导：清单里还没有这条通道时（首份清单是在分支上生成的，正式通道天然是空的），
+            #   现问一次「最新正式版」把它接上。不引导的话正式通道会一直空着 —— 而那正是
+            #   绝大多数用户走的通道，表现为「查更新说没有适配本平台的包」。
+            #   prerelease 没有等价的 latest 端点，只能等下一次分支推送把它建起来。
+            if [ -z "$tag" ] && [ "$ch" = "release" ]; then
+              tag="$(curl -fsSL --max-time 30 -H "Authorization: token ${GITHUB_TOKEN}"                        "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/latest"                      | python3 -c "import json,sys;print(json.load(sys.stdin).get('tag_name',''))" || echo "")"
+              [ -z "$tag" ] || echo "正式通道为空，已从 /releases/latest 引导到 $tag"
+            fi
+            echo "${ch}_tag=${tag}" >> "$GITHUB_OUTPUT"
+            echo "$ch -> ${tag:-无}"
+          done
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Rebuild both channels
+        if: steps.prev.outputs.skip != 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ steps.prev.outputs.release_tag }}
+          PRERELEASE_TAG: ${{ steps.prev.outputs.prerelease_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp version.json prev.json
+          for ch in release prerelease; do
+            if [ "$ch" = "release" ]; then tag="$RELEASE_TAG"; else tag="$PRERELEASE_TAG"; fi
+            [ -n "$tag" ] || { echo "$ch 通道还没有版本，跳过"; continue; }
+            python3 .github/scripts/build_version_manifest.py \
+              --tag "$tag" --channel "$ch" --prev prev.json -o version.json
+            cp version.json prev.json
+          done
+
+      - name: Publish if changed
+        id: diff
+        if: steps.prev.outputs.skip != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `generated` 每次都变，不能拿整份文件比 —— 那样每半小时都会传一次新资源，
+          # release 的资源历史会被这个噪声淹掉。只比真正的内容。
+          norm() { python3 -c "import json,sys;d=json.load(open(sys.argv[1],encoding='utf-8'));d.pop('generated',None);print(json.dumps(d,ensure_ascii=False,sort_keys=True))" "$1"; }
+          curl -fsSL --max-time 60 -o old.json             "https://github.com/${GITHUB_REPOSITORY}/releases/download/version/version.json" || : > old.json
+          if [ -s old.json ] && [ "$(norm old.json)" = "$(norm version.json)" ]; then
+            echo "内容无变化，不重传"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "有变化，准备发布"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish manifest
+        if: steps.diff.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: version
+          name: version manifest
+          make_latest: false
+          prerelease: false
+          overwrite_files: true
+          files: version.json
