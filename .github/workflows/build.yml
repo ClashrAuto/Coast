@@ -110,6 +110,12 @@ jobs:
       #     门禁比没有门禁更危险：它让人以为这一类已经被挡住了。
       - run: python3 clashauto-c++/scripts/qml_positioner_check.py --selftest
       - run: python3 clashauto-c++/scripts/qml_positioner_check.py clashauto-c++/qml clashauto-c++/installer/ui/qml
+      # ★ 「算版本号」那段在每个 job 里各有一份，必须逐字一致。不一致 = 同一个 commit
+      #   算出两个 tag：产物传到 A，trigger-mac 通知 schat.build 发到 B，两边 CI 全绿而
+      #   release 是劈开的（2026-08-10 实测劈过一次）。2026-08-11 又发现 macos-swift 那份
+      #   漏了 minor 兜底，而它的注释还写着「口径与 windows/linux job 完全一致」——
+      #   这种事人眼核对不可靠。
+      - run: python3 clashauto-c++/scripts/version_recipe_check.py
       # 安装器原生侧那张语言表（25 句 × 13 语言 = 325 格）是**生成物**。生成物的经典
       # 隐患是有人直接手改产物：改动能编、能跑、能过自检，然后下一次跑生成器时被
       # **静默还原** —— 而那时改的人早忘了这回事，只会看到「我明明改过的文案又变回去了」。
@@ -2023,6 +2029,13 @@ jobs:
           base="$(sed -nE 's/.*project[[:space:]]*\([[:space:]]*[^ ]+[[:space:]]+VERSION[[:space:]]+([0-9]+(\.[0-9]+){1,3}).*/\1/p' clashauto-c++/CMakeLists.txt | head -n 1)"
           major="$(echo "$base" | cut -d. -f1)"
           minor="$(echo "$base" | cut -d. -f2)"
+          # ★ 这行兜底以前**只有这一份漏了**（另外四处 macos/linux/manifest/trigger-mac 都有），
+          #   而本 job 的注释还写着「口径与 windows/linux job 完全一致」。
+          #   `project(... VERSION 1)` 这种没有次版本号的写法会让 cut -f2 取到空串，
+          #   于是这条腿算出 `1..<n>` 而别人算出 `1.0.<n>` —— 同一个 commit 出两个 tag，
+          #   而 trigger-mac 是按**它自己**那份算的目标 tag 通知 schat.build 的，
+          #   于是签名包会发到一个本腿产物之外的 tag 上。属于低概率但后果很脏的一类。
+          [ -n "$minor" ] || minor=0
           count="$(git rev-list --count HEAD)"
           version="${major}.${minor}.${count}"
           # 主分支 = 正式版，其余分支 = prerelease。tag 再缀短 sha，
