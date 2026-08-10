@@ -156,8 +156,8 @@ jobs:
           # APP_VERSION 保持纯数字 major.minor.build —— 资源文件名(Coast-<ver>-…)和 app 内的
           # 版本比较都靠它，掺字母会一起坏掉。分支上 build 天然大于主分支（= 主分支提交数 + 本分支
           # 的提交），版本序自然正确；tag 再加个短 sha，防「两个分支各 +N 撞到同一个号」。
-          $isPre = if ("${{ github.ref }}" -eq "refs/heads/master" -or "${{ github.ref }}" -eq "refs/heads/main") { "false" } else { "true" }
-          $tag = if ($isPre -eq "true") { "v$version-beta.$("${{ github.sha }}".Substring(0,7))" } else { "v$version" }
+          $isPre = if ($env:SOURCE_REF -eq "master" -or $env:SOURCE_REF -eq "main") { "false" } else { "true" }
+          $tag = if ($isPre -eq "true") { "v$version-beta.$(git rev-parse --short=7 HEAD)" } else { "v$version" }
           "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "IS_PRERELEASE=$isPre" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
@@ -794,10 +794,10 @@ jobs:
           build="$(git rev-list --count HEAD)"
           version="${major}.${minor}.${build}"
           # 主分支 = 正式版，其余分支 = prerelease。取舍见 windows job 那段注释。
-          if [ "${{ github.ref }}" = "refs/heads/master" ] || [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          if [ "${SOURCE_REF}" = "master" ] || [ "${SOURCE_REF}" = "main" ]; then
             is_pre=false; tag="v$version"
           else
-            is_pre=true; tag="v$version-beta.$(echo "${{ github.sha }}" | cut -c1-7)"
+            is_pre=true; tag="v$version-beta.$(git rev-parse --short=7 HEAD)"
           fi
           {
             echo "APP_VERSION=$version"
@@ -1266,10 +1266,10 @@ jobs:
           build="$(git rev-list --count HEAD)"
           version="${major}.${minor}.${build}"
           # 主分支 = 正式版，其余分支 = prerelease。取舍见 windows job 那段注释。
-          if [ "${{ github.ref }}" = "refs/heads/master" ] || [ "${{ github.ref }}" = "refs/heads/main" ]; then
+          if [ "${SOURCE_REF}" = "master" ] || [ "${SOURCE_REF}" = "main" ]; then
             is_pre=false; tag="v$version"
           else
-            is_pre=true; tag="v$version-beta.$(echo "${{ github.sha }}" | cut -c1-7)"
+            is_pre=true; tag="v$version-beta.$(git rev-parse --short=7 HEAD)"
           fi
           {
             echo "APP_VERSION=$version"
