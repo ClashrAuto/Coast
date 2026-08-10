@@ -1703,11 +1703,11 @@ jobs:
           major="$(echo "$base" | cut -d. -f1)"
           minor="$(echo "$base" | cut -d. -f2)"; [ -n "$minor" ] || minor=0
           version="${major}.${minor}.$(git rev-list --count HEAD)"
-          if [ "$GITHUB_REF" = "refs/heads/master" ] || [ "$GITHUB_REF" = "refs/heads/main" ]; then
+          if [ "${SOURCE_REF}" = "master" ] || [ "${SOURCE_REF}" = "main" ]; then
             echo "tag=v${version}" >> "$GITHUB_OUTPUT"
             echo "channel=release" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=v${version}-beta.${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+            echo "tag=v${version}-beta.$(git rev-parse --short=7 HEAD)" >> "$GITHUB_OUTPUT"
             echo "channel=prerelease" >> "$GITHUB_OUTPUT"
           fi
 
@@ -1847,10 +1847,10 @@ jobs:
           major="$(echo "$base" | cut -d. -f1)"
           minor="$(echo "$base" | cut -d. -f2)"; [ -n "$minor" ] || minor=0
           version="${major}.${minor}.$(git rev-list --count HEAD)"
-          if [ "$GITHUB_REF" = "refs/heads/master" ] || [ "$GITHUB_REF" = "refs/heads/main" ]; then
+          if [ "${SOURCE_REF}" = "master" ] || [ "${SOURCE_REF}" = "main" ]; then
             is_pre=false; tag="v${version}"
           else
-            is_pre=true; tag="v${version}-beta.${GITHUB_SHA:0:7}"
+            is_pre=true; tag="v${version}-beta.$(git rev-parse --short=7 HEAD)"
           fi
           { echo "version=$version"; echo "tag=$tag"; echo "prerelease=$is_pre"; } >> "$GITHUB_OUTPUT"
           echo "目标 release: $tag (prerelease=$is_pre)"
@@ -1887,9 +1887,9 @@ jobs:
           # `github.event.head_commit.message` 就能原样读到。
           make_trigger_commit() {
             git commit --allow-empty -m "trigger: clashauto macOS (swift + qt)" \
-              -m "source-repo: ${GITHUB_REPOSITORY}" \
-              -m "source-sha: ${GITHUB_SHA}" \
-              -m "source-ref: ${GITHUB_REF_NAME}" \
+              -m "source-repo: ${SOURCE_REPO}" \
+              -m "source-sha: $(git rev-parse HEAD)" \
+              -m "source-ref: ${SOURCE_REF}" \
               -m "product: coast-swift" \
               -m "product: coast-qt" \
               -m "release-tag: ${TARGET_TAG}" \
@@ -1925,7 +1925,7 @@ jobs:
             make_trigger_commit
           done
           echo "已触发签名构建 → ${SCHAT_REPO}@${branch}"
-          echo "  源: clashauto@${GITHUB_SHA} (${GITHUB_REF_NAME})"
+          echo "  源: ${SOURCE_REPO}@$(git rev-parse HEAD) (${SOURCE_REF})"
           echo "  目标 release: ${TARGET_TAG} (prerelease=${TARGET_PRERELEASE})"
           echo "  产品线: coast-swift（…-macos-universal.dmg）+ coast-qt（…-macos-universal-qt.dmg）"
 
@@ -1991,10 +1991,10 @@ jobs:
           version="${major}.${minor}.${count}"
           # 主分支 = 正式版，其余分支 = prerelease。tag 再缀短 sha，
           # 防「两个分支各 +N 撞到同一个号」。口径与 windows/linux job 完全一致。
-          if [ "$GITHUB_REF" = "refs/heads/master" ] || [ "$GITHUB_REF" = "refs/heads/main" ]; then
+          if [ "${SOURCE_REF}" = "master" ] || [ "${SOURCE_REF}" = "main" ]; then
             is_pre=false; tag="v${version}"
           else
-            is_pre=true; tag="v${version}-beta.${GITHUB_SHA:0:7}"
+            is_pre=true; tag="v${version}-beta.$(git rev-parse --short=7 HEAD)"
           fi
           {
             echo "version=${version}"
