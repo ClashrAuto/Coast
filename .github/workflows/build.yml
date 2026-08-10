@@ -104,6 +104,11 @@ jobs:
       #   构建期零信号；运行期只有该组件真被实例化时才打一行警告，开发机上很容易一直看不见。
       #   2026-08-10 实测：出货的 v1.0.1143 里 ConfirmOverlay 的「5 分钟内不再询问」勾选框
       #   就是这样既错位又点不动的，是从 validate 的无头运行日志里翻出来的。
+      #   ★ 先跑它自己的自检：第一版是**按行**扫的，单行写法
+      #     `MouseArea { anchors.fill: parent }` 整个不可见 —— 合成用例里三条该命中的一条都
+      #     没抓到，只因真实那处碰巧是多行才显得能用，还就这么进了 CI。只在特定排版下生效的
+      #     门禁比没有门禁更危险：它让人以为这一类已经被挡住了。
+      - run: python3 clashauto-c++/scripts/qml_positioner_check.py --selftest
       - run: python3 clashauto-c++/scripts/qml_positioner_check.py clashauto-c++/qml clashauto-c++/installer/ui/qml
       # 安装器原生侧那张语言表（25 句 × 13 语言 = 325 格）是**生成物**。生成物的经典
       # 隐患是有人直接手改产物：改动能编、能跑、能过自检，然后下一次跑生成器时被
