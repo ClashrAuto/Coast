@@ -1,0 +1,2288 @@
+# ⚠️ **本文件是生成的，别直接改。**
+#
+# 源在 ClashrAuto/clashauto 的 `.github/workflows/release.yml`，
+# 生成器是那边的 `.github/scripts/gen_coast_workflow.py`。改构建逻辑请改源仓库，
+# 然后重跑生成器把这份覆盖掉 —— 手改这里的话，下一次生成会把你的改动静默抹掉。
+#
+# 为什么要有这份拷贝：`ClashrAuto` 是个人账号，而 GitHub 只允许**组织**下的私有仓库
+# 把 workflow 共享给别的仓库。clashauto 转私有后 Coast 无法 `uses:` 它的 workflow，
+# 所以 CI 只能物理上住在这里，检出 clashauto 的源码来构建。
+
+name: Build and Release
+
+on:
+  # Coast 里没有源码，所以不存在「推了什么」—— 构建对象由输入指定。
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'clashauto 的分支名或 sha（决定构建哪一版）'
+        required: false
+        default: master
+      publish:
+        description: '是否发布 Release（false = 只出 artifact，用来试管线）'
+        required: false
+        default: 'true'
+  # clashauto 那边推送后自动触发用。client_payload 里带 ref。
+  repository_dispatch:
+    types: [build]
+
+
+permissions:
+  contents: write
+
+# 同一个功能分支连着推几次时，只留最新那次在跑，把前面几次取消掉。
+#
+# ★ 为什么需要：所有分支都构建，而这套构建里静态 Qt 那几个 job 动辄几十分钟。
+#   在一个分支上连推四五次 = 四五个整轮（每轮 7 个 job）同时挤在 runner 池里，
+#   越早推的越先占位，于是**最新那次要等最久**——「推上去、等包、下载验证」这条
+#   基本流程直接变成几小时一轮。2026-08-08 实测堵到 6 个 run × 7 job 同时排队。
+#
+# ★ master/main **绝不取消**：那里每一个提交都是一次正式发布（版本号 = 提交计数），
+#   取消掉就等于那个版本永远没发出来。做法是给主分支的每个 run 一个**独一无二**的
+#   分组键（run_id），于是它永远不会和任何人同组 —— 既不取消别人，也不排队等别人。
+#   其余分支按 ref 共享一个组，新的把旧的顶掉。
+#   被取消的 beta 只会留下一个资产不全的预发布，而它的 tag 里带着自己的 sha7、
+#   与下一轮互不相干；客户端对这种包是「挑不到自己平台的资产 → 判无更新」，不会装错。
+concurrency:
+  group: >-
+    coast-build-${{ env.SOURCE_REF }}-${{
+      (env.SOURCE_REF == 'master' || env.SOURCE_REF == 'main') && github.run_id || 'shared'
+    }}
+  cancel-in-progress: true
+
+env:
+  # ★ 构建对象。workflow_dispatch 用输入，repository_dispatch 用 client_payload，
+  #   都没有就退回 master。下面凡是原本读 env.SOURCE_REF 的地方，一律改读它。
+  SOURCE_REPO: ClashrAuto/clashauto
+  SOURCE_REF: >-
+    ${{ github.event.inputs.ref || github.event.client_payload.ref || 'master' }}
+  APP_NAME: Coast
+  # ★ Qt 版本**按平台分开**：Windows / macOS 走 6.11，Linux 留在 6.8.3。
+  #   分开写而不是一个全局值，是因为这两组的约束不一样，将来抬版本也不会同步动。
+  #   注意资产名里带版本号（qtstatic-<ver>-<target>-<配方哈希>.tar.gz），改这里 = 换资产：
+  #   ClashrAuto/qt-static 上必须有对应版本的预编产物，否则该平台会退回源码构建
+  #   （Windows 两个 job 传的是 build-deadline-min: 0，会**当场失败**而不是编到超时）。
+  QT_VERSION: 6.11.1
+  QT_VERSION_LINUX: 6.8.3
+  BUILD_DIR: build-release
+  STAGE_DIR: dist/package/Coast
+
+# ★★ 2026-08-08 起三端全部**静态链接** Qt：包里不再有任何 Qt 库/插件/qml 目录，
+#    Windows 连 MSVC 运行库都进了 exe（-static-runtime + /MT），产物就是一个可执行文件。
+#    静态 Qt 是自己从源码编的 —— aqtinstall 只发共享构建，官方从不提供静态二进制，
+#    这是整件事唯一的真成本。配方与缓存见 .github/actions/qt-static/，预热见 qt-static.yml。
+#    因此下面**没有** windeployqt / macdeployqt / 拷 Qt 运行时 / patchelf RPATH 这些步骤了。
+#    唯一的例外是 Linux：glibc / xcb / GL / fontconfig 跨不过内核与驱动那条边界，
+#    只能动态链，所以 .deb 仍有一串 Depends（但 Qt 自己一个都不占了）。
+
+jobs:
+  # 「无大括号的控制语句后跟了两条同缩进语句」——只有第一条真被守卫。
+  # CMakeLists 已把 GCC/Clang 的 -Wmisleading-indentation 设为错误，但那道门禁在 CI 里
+  # **漏掉了最需要它的文件**：Windows 专属源（NetStack.cpp、L2Endpoint_win.cpp…）在 CI 中
+  # 只被 MSVC 编译，而 MSVC 没有等价警告；macOS 专属源两边 GCC 也都碰不到。
+  # 2026-08-06 一晚踩了三处，两处正好落在 Windows 专属文件里（一处让诊断数据常年说谎并
+  # 越界读 f[-1]，一处是取消代理时的空指针解引用）。这个检查与平台无关，30 秒跑完。
+  # 脚本自带变异测试记录：对上述两个真 bug 分别注入验证过会红（见脚本头注释）。
+  lint-indent:
+    name: Misleading-indentation scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+      - run: python3 clashauto-c++/scripts/check_misleading_indent.py
+      # Qt 线的 i18n 门禁。Swift 线早就有一份，本线一直没有 —— 而它挡的是**静默**失效：
+      # qsTr 的串不在语言表里时，Qt 退回源串，于是 11 种语言全显示中文、零报错，
+      # 而开发机上完全看不出来（开发者用的就是中文）。第一次跑就找出 3 条漏译。
+      # 放在这条腿上：纯 Python，不需要任何构建产物，几秒钟出结果。
+      - run: python3 clashauto-c++/scripts/i18n_check.py
+      # 安装器原生侧那张语言表（25 句 × 13 语言 = 325 格）是**生成物**。生成物的经典
+      # 隐患是有人直接手改产物：改动能编、能跑、能过自检，然后下一次跑生成器时被
+      # **静默还原** —— 而那时改的人早忘了这回事，只会看到「我明明改过的文案又变回去了」。
+      # 所以重跑一遍生成器，断言工作树没有任何变化。
+      - name: NativeStrings.h 与生成器一致
+        run: |
+          python3 clashauto-c++/scripts/gen_native_strings.py
+          if ! git diff --exit-code -- clashauto-c++/installer/core/NativeStrings.h; then
+            echo "::error::NativeStrings.h 与 scripts/gen_native_strings.py 的产物不一致 —— \
+          它是生成物，改文案要改生成器再重新生成，别直接改头文件"
+            exit 1
+          fi
+
+  windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # core_prefixes：打包集成的内核产物名前缀（fork ClashrAuto/clash 的正式版通道），
+          # 逗号分隔按优先级排列。x64 优先 -compatible（v1 基线，普通 amd64 是 GOAMD64=v3，
+          # 老 CPU 直接非法指令崩），与应用内 CoreRelease.h 的 assetPrefixes 一字不差。
+          # （qt_arch 已删：目标 Qt 不再来自 aqt，而是 .github/actions/qt-static 自己编的静态版。
+          #   arm64 仍要一份 aqt 的**宿主** Qt，但那是写死的 win64_msvc2022_64，无需矩阵参数。）
+          - arch: x64
+            cmake_arch: x64
+            core_prefixes: coast-windows-amd64-compatible-,coast-windows-amd64-v1-
+          - arch: arm64
+            cmake_arch: ARM64
+            core_prefixes: coast-windows-arm64-
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+          fetch-depth: 0
+
+      - name: Resolve build version
+        shell: pwsh
+        run: |
+          # 基线 major.minor 取自 CMakeLists，构建号用 git 提交数自动递增（每次提交 +1）
+          $cmake = Get-Content "clashauto-c++\CMakeLists.txt" -Raw
+          if ($cmake -notmatch 'project\s*\(\s*\S+\s+VERSION\s+([0-9]+)(?:\.([0-9]+))?') {
+            throw "Cannot find project VERSION in clashauto-c++\CMakeLists.txt"
+          }
+
+          $major = $Matches[1]
+          $minor = if ($Matches[2]) { $Matches[2] } else { "0" }
+          $build = "$(git rev-list --count HEAD)".Trim()
+          $version = "$major.$minor.$build"
+          # 主分支 = 正式版，其余分支 = prerelease。
+          # APP_VERSION 保持纯数字 major.minor.build —— 资源文件名(Coast-<ver>-…)和 app 内的
+          # 版本比较都靠它，掺字母会一起坏掉。分支上 build 天然大于主分支（= 主分支提交数 + 本分支
+          # 的提交），版本序自然正确；tag 再加个短 sha，防「两个分支各 +N 撞到同一个号」。
+          $isPre = if ("${{ github.ref }}" -eq "refs/heads/master" -or "${{ github.ref }}" -eq "refs/heads/main") { "false" } else { "true" }
+          $tag = if ($isPre -eq "true") { "v$version-beta.$("${{ github.sha }}".Substring(0,7))" } else { "v$version" }
+          "APP_VERSION=$version" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "IS_PRERELEASE=$isPre" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "Release version: $version tag=$tag prerelease=$isPre (build number = commit count)"
+
+      # 宿主 Qt 那一步没了：arm64 交叉编译要的同版本宿主 Qt 现在由 qt-static action 自己解析
+      # （取同版本同配方的 windows-x64 静态 Qt），并通过 outputs.host-qt-root 交回来。
+      # 原来那步用的 aqtinstall 在 6.11 上是必挂的 —— Qt 从 6.9 起改了在线仓库目录布局，
+      # aqt 3.3.0（PyPI 最新）仍按旧布局拼路径，报 "Failed to locate XML data"。
+
+      - name: Static Qt
+        id: qt
+        # 命中缓存就复用（秒级），没命中就从源码编（首次约 1.5–2 小时）。
+        # cache-hit=false 且这一步跑了很久，说明缓存被 GitHub 淘汰了 —— 手动跑一次
+        # qt-static.yml 重新预热即可，不是代码问题。
+        uses: ./.github/actions/qt-static
+        with:
+          qt-version: ${{ env.QT_VERSION }}
+          target: windows-${{ matrix.arch }}
+          # ★ 发布流水线**一个模块都不编**：缓存没就绪就当场失败（约 2 分钟），
+          #   而不是编到 6 小时上限被掐。理由是这两件事凑一起会互相抵消：
+          #   本 workflow 有并发组（同分支只留最新那轮），而被取消的 job 跑不到
+          #   回写缓存那一步 —— 于是"边编边被下一次推送取消"= 每次都白烧、进度永远存不下来。
+          #   真正的编译交给 Warm static Qt cache：那个 workflow 没有并发组，
+          #   跑几轮断点续编就能把缓存推完，之后这里秒级命中。
+          build-deadline-min: '0'
+
+      - name: Export Qt root
+        shell: bash
+        run: echo "QT_ROOT=${{ steps.qt.outputs.qt-root }}" >> "$GITHUB_ENV"
+
+      # NSIS 那一步已删（2026-08-09）。安装器改成仓库内的 clashauto-c++/installer/，
+      # 与应用一起用 MSVC 编出来 —— 装机链上不再有任何外部工具依赖。
+      - name: Install Npcap SDK
+        shell: pwsh
+        # 透明网关 Windows 二层用 Npcap；编译需其 SDK（头 + 导入库）。运行时另需目标机装 Npcap 驱动。
+        # npcap.com 偶发超时 → 多镜像 + 重试，避免网络抖动挡住整个 Windows 构建。
+        run: |
+          $zip = "$env:RUNNER_TEMP\npcap-sdk.zip"
+          $urls = @(
+            "https://npcap.com/dist/npcap-sdk-1.13.zip",
+            "https://nmap.org/npcap/dist/npcap-sdk-1.13.zip"
+          )
+          $ok = $false
+          foreach ($u in $urls) {
+            for ($i = 1; $i -le 3; $i++) {
+              try {
+                Invoke-WebRequest -Uri $u -OutFile $zip -TimeoutSec 90
+                if ((Get-Item $zip).Length -gt 100000) { $ok = $true; break }
+              } catch { Write-Host "下载 $u 第 $i 次失败: $_"; Start-Sleep -Seconds 6 }
+            }
+            if ($ok) { break }
+          }
+          if (-not $ok) { throw "Npcap SDK 下载失败（所有镜像/重试均未成功）" }
+          $dst = "$env:RUNNER_TEMP\npcap-sdk"
+          Expand-Archive -Path $zip -DestinationPath $dst -Force
+          "NPCAP_SDK=$dst" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Install Rust (coaststack)
+        # 透明网关的 TCP 数据面（smoltcp，rust/coaststack）**只在 Windows 构建**——
+        # Linux 走 TPROXY、macOS 走 pf rdr，都不需要用户态栈。所以 macos/linux/trigger-mac
+        # 三个 job 与外部签名仓库 integemjack/schat.build 一行都不用动。
+        # target 按架构选；staticlib 形态下 cargo 不调链接器，ARM64 交叉不需要 ARM64 的 cl.exe
+        # （前提是依赖树纯 Rust、无 cc crate —— 见 rust/coaststack/README.md）。
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.arch == 'arm64' && 'aarch64-pc-windows-msvc' || 'x86_64-pc-windows-msvc' }}
+
+      - name: Rust unit tests (coaststack)
+        # 本仓库此前没有任何单测框架，Rust 侧是第一份，成本近乎为零。
+        # 只在 x64 跑：arm64 是交叉编译，runner 上跑不了 arm64 测试。
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        working-directory: clashauto-c++/rust/coaststack
+        run: cargo test --release --locked
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $args = @(
+            "-S", "clashauto-c++",
+            "-B", $env:BUILD_DIR,
+            "-G", "Visual Studio 17 2022",
+            "-A", "${{ matrix.cmake_arch }}",
+            "-DCMAKE_PREFIX_PATH=$env:QT_ROOT",
+            "-DAPP_VERSION=$env:APP_VERSION"
+          )
+          # OpenSSL（可选）：给 CoastCore 的 ss/vmess/reality 提供裸 AEAD/X25519。
+          # ★ 指的是 qt-static 缓存里那份 **/MT 静态** OpenSSL，不是 runner 自带的
+          #   C:\Program Files\OpenSSL —— 后者是 /MD 编的，切到静态 CRT 之后链不上，
+          #   而"链不上"的表现是 CMake 静默把这三个协议降级掉、构建照样全绿。
+          # **只对 x64**：arm64 是交叉编译，环境里没有 arm64 的 OpenSSL，硬指过去会拿到
+          # 宿主 x64 的库（编译过、链接炸）—— 这条限制与静态化无关，是一直如此。
+          if ("${{ matrix.arch }}" -eq "x64") {
+            $sslRoot = "$env:QT_ROOT/_openssl/x64-windows-static"
+            if (Test-Path "$sslRoot/lib/libcrypto.lib") {
+              $args += "-DOPENSSL_ROOT_DIR=$sslRoot"
+            } else {
+              Write-Host "::warning::静态 OpenSSL 不在缓存里（$sslRoot）——ss/vmess/reality 将回退 mihomo"
+            }
+          }
+          if ("${{ matrix.arch }}" -eq "arm64") {
+            # 宿主 Qt 由 qt-static action 解析（= 同版本同配方的 windows-x64 静态 Qt）。
+            $hostQt = "${{ steps.qt.outputs.host-qt-root }}"
+            if (-not $hostQt) { throw "arm64 交叉编译缺宿主 Qt —— qt-static 没给出 host-qt-root" }
+            $args += "-DQT_HOST_PATH=$hostQt"
+          }
+          cmake @args
+
+      - name: Build
+        shell: pwsh
+        # 失败时把 MSVC 的报错行**作为 annotation 吐出来**（`::error::`）。
+        # 为什么值得这么写：作业日志的下载接口要仓库 admin 权限（未授权访问返回
+        # "Must have admin rights to Repository"），而 annotation 是公开可读的。Windows 构建
+        # 曾在 v1.1 上连红 14 次没人发现具体原因，就是因为「看得到红灯、看不到报错」。
+        run: |
+          $log = "$env:RUNNER_TEMP\build.log"
+          cmake --build $env:BUILD_DIR --config Release --parallel 2>&1 | Tee-Object -FilePath $log
+          $rc = $LASTEXITCODE
+          if ($rc -ne 0) {
+            $errs = Select-String -Path $log -Pattern 'error [A-Z]+[0-9]+|fatal error|LNK[0-9]+' |
+                    Select-Object -First 25
+            foreach ($e in $errs) { Write-Host "::error::$($e.Line.Trim())" }
+            if (-not $errs) { Write-Host "::error::构建失败但日志里没有可识别的报错行（见完整日志）" }
+            exit $rc
+          }
+
+      - name: 链接失败诊断（仅失败时）
+        # ★ 只在上一步失败后跑。存在的理由是一次真实排查：MSVC 报
+        #   `LNK2019: unresolved external symbol ControlApi::ControlApi(...)`，
+        #   而同一份源码在 MinGW / Ninja(Linux, macOS) 上都正常，且 MSVC 编译 ControlApi.cpp
+        #   时零错误零警告 —— 也就是说「obj 编出来了，符号却不在里面」。
+        #   光看日志推不出根因，而每猜一次要等一整轮 CI。这一步把 .obj 里的符号直接列出来，
+        #   一次就能分清是「压根没生成」还是「生成了但签名不同」。
+        #   构建失败时 .obj 仍在原地，所以这时候查最省事。
+        if: failure()
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationPath
+          $dumpbin = Get-ChildItem "$vs\VC\Tools\MSVC" -Recurse -Filter dumpbin.exe -ErrorAction SilentlyContinue |
+                     Select-Object -First 1 -ExpandProperty FullName
+          $obj = Get-ChildItem $env:BUILD_DIR -Recurse -Filter "ControlApi.obj" -ErrorAction SilentlyContinue |
+                 Select-Object -First 1 -ExpandProperty FullName
+          Write-Host "dumpbin=$dumpbin"
+          Write-Host "obj=$obj"
+          if ($dumpbin -and $obj) {
+            $syms = & $dumpbin /symbols $obj | Select-String '\?\?0ControlApi'
+            if ($syms) {
+              Write-Host "== ControlApi.obj 里与构造函数相关的符号 =="
+              $syms | ForEach-Object { Write-Host "::error::SYM $($_.Line.Trim())" }
+            } else {
+              Write-Host "::error::ControlApi.obj 里**没有任何**构造函数符号（??0ControlApi*）"
+            }
+          } else {
+            Write-Host "::error::找不到 dumpbin 或 ControlApi.obj，诊断跳过"
+          }
+
+      - name: coaststack ABI self-test
+        # 只在 x64 跑（arm64 是交叉编译，runner 上跑不了 arm64 产物）。
+        # 为什么必须有这一条：Phase 1 的 Rust 库运行时还没接进 NetStack，若只看构建绿灯，
+        # 「库编出来了」和「库真能被 C++ 调用、结构体布局与错误码语义都对得上」是分不清的。
+        # 这里跨 FFI 走一遍完整往返，任何一项对不上就非 0 退出、当场红灯。
+        # （本地已验证可证伪：故意改坏一个断言 → exit=1 并指明位置。）
+        #
+        # ★★ 这一步曾经**长期是假绿灯**，两个原因叠在一起，都要照着办：
+        #   ① `& $exe` 对 **GUI 子系统**的 exe 不阻塞，`$LASTEXITCODE` 拿不到值（是 $null）。
+        #      `$null -ne 0` 为真 → 打出 `::error::` → 但 `exit $null` 等于 `exit`，退出码 0,
+        #      于是"报了错还是绿的"。必须用 Start-Process -Wait -PassThru，且 `exit 1` 用常量。
+        #   ② 曾经还要把 $QT_ROOT\bin 挂上 PATH：构建目录里没有 Qt 的 DLL（windeployqt 在
+        #      后面的打包步骤才跑），exe 起不来，退出码 -1073741515 = 0xC0000135
+        #      STATUS_DLL_NOT_FOUND。**静态 Qt 之后这条不存在了** —— 刚链出来的 exe 就是
+        #      完整的，不依赖任何外部 DLL。下面两步同理，都已去掉那行 PATH。
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        env:
+          COAST_RUSTSTACK_SELFTEST: "1"
+        run: |
+          $exe = Join-Path $env:BUILD_DIR "Release\Coast.exe"
+          if (-not (Test-Path $exe)) { throw "找不到 $exe" }
+          $out = Join-Path $env:RUNNER_TEMP "ruststack.out"
+          $p = Start-Process -FilePath $exe -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out
+          if ($p.ExitCode -ne 0) {
+            if (Test-Path $out) { Get-Content $out }
+            Write-Host "::error::coaststack ABI 自证失败（exit=$($p.ExitCode)）——C ABI 与 Rust 侧不一致"
+            exit 1
+          }
+
+      - name: coaststack gateway self-test
+        # 整条数据面（NetStack + smoltcp）的行为自证：合成帧进去，断言 SYN-ACK 的源端口被还原成
+        # 原始目的端口、且拨出去的 SOCKS CONNECT 带着**该设备**的用户名。
+        # 不碰真网卡、不需要 root：假二层端点 + 假 SOCKS + 合成帧。
+        #
+        # ★ 这一步曾是 smoltcp vs lwIP 的 A/B（同一套断言跑两条栈）。lwIP 已整体移除，没有第二条
+        #   栈可比了。记一笔它的价值：那个 A/B 抓到过一个真缺陷 —— smoltcp 侧一度在 SynReceived
+        #   就拨上游（lwIP 是握手完成才 accept），等于 SYN 洪水每个 SYN 都建一条上游连接。
+        #   **只测新实现是发现不了这类差异的**，以后再换任何数据面，先把对照跑起来。
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:BUILD_DIR "Release\Coast.exe"
+          $env:COAST_SMOLGW_SELFTEST = "1"
+          $out = Join-Path $env:RUNNER_TEMP "smolgw.out"
+          $p = Start-Process -FilePath $exe -Wait -PassThru -NoNewWindow -RedirectStandardOutput $out
+          Remove-Item Env:\COAST_SMOLGW_SELFTEST
+          if ($p.ExitCode -ne 0) {
+            if (Test-Path $out) { Get-Content $out }
+            Write-Host "::error::网关数据面自测失败（exit=$($p.ExitCode)）"
+            exit 1
+          }
+
+      - name: Pure-logic self-tests (static plugin deps / ARP parse / per-NIC egress / per-NIC wiring / SOCKS UDP identity / dead-conn reap / TIDE nodes / bundled-core seeding)
+        # 与上面两条不同，这里用 **Start-Process -Wait -PassThru** 而不是 `& $exe`：
+        # Coast.exe 是 WIN32_EXECUTABLE（GUI 子系统），直接调用时 PowerShell 不保证等它退出，
+        # 拿到的 $LASTEXITCODE 可能压根没被设过 —— 那样这一步的绿灯说明不了任何事。
+        # 顺带把 stdout 收下来，失败时把断言逐条打出来，省得只看到一个退出码。
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:BUILD_DIR "Release\Coast.exe"
+          if (-not (Test-Path $exe)) { throw "找不到 $exe" }
+          # COAST_BUNDLEDCORE_SELFTEST 在 Windows 上尤其要跑：集成内核那边的文件名是
+          # core.exe（#ifdef 分支），而「全新安装打不开」正是从这条落位路径上来的。
+          # COAST_STATICDEPS_SELFTEST 是静态化引入的**唯一**门禁：TLS 后端 / QSQLITE /
+          # 图片格式 / QML 模块这些插件在静态构建下靠链接期导入，漏了不报任何编译或链接错误，
+          # 只是运行时少一块功能（订阅拉不到、历史不记、空窗口）。见 src/StaticDepsSelfTest.cpp。
+          # 控制端点那三条（CONTROLAPI / CONTROLSERVER / MCP）在 Windows 上尤其要跑：
+          # 传输层用的是**命名管道**，与 POSIX 的 unix socket 是两套实现（权限模型、陈旧端点
+          # 的清理、半包切分的时序都不一样），Linux 那条腿证明不了这边。
+          # ★ CONTROLSERVER 不能在设了 COAST_CONTROL_ALLOW_POLICY 的环境里跑（逃生门会把
+          #   策略级放行，"门禁挡住了没有"的断言就永远通不过）。CI 本就不设它。
+          foreach ($t in @('COAST_STATICDEPS_SELFTEST',
+                           'COAST_ARPPARSE_SELFTEST', 'COAST_NICEGRESS_SELFTEST',
+                           'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
+                           'COAST_TCPREAP_SELFTEST', 'COAST_TIDE_SELFTEST',
+                           'COAST_BUNDLEDCORE_SELFTEST',
+                           'COAST_CONTROLAPI_SELFTEST', 'COAST_CONTROLSERVER_SELFTEST',
+                           'COAST_MCP_SELFTEST', 'COAST_CONFIGVALIDATE_SELFTEST',
+                           'COAST_CONFIRM_SELFTEST', 'COAST_RULEEXPLAIN_SELFTEST',
+                           'COAST_CHANGELOG_SELFTEST', 'COAST_NODEHEALTH_SELFTEST',
+                           'COAST_SCHEDULE_SELFTEST')) {
+            Set-Item "Env:\$t" '1'
+            $out = Join-Path $env:RUNNER_TEMP "$t.out"
+            # ★★ 用 WaitForExit(30000) 而不是 -Wait：钩子一旦没被注册（比如被裹进某个平台
+            #   专属的 #ifdef），设了 env 的效果不是"测试失败"，而是**把整个 GUI 正常启动、
+            #   进程永不退出** —— 配上 -Wait 就是这一步一直挂到 job 超时（默认 6 小时），
+            #   日志里什么都没有。2026-08-08 在 Linux 上实测过一次，进程跑满 316 秒仍在 do_poll。
+            #   这些自测本身都是毫秒级的，30 秒到不了必是出事了，不是慢。
+            $p = Start-Process -FilePath $exe -PassThru -NoNewWindow -RedirectStandardOutput $out
+            $exited = $p.WaitForExit(30000)
+            Remove-Item "Env:\$t"
+            if (-not $exited) {
+              try { $p.Kill() } catch {}
+              Write-Host "::error::$t 30 秒未退出 —— 多半是这个钩子没在 main_qml.cpp 里注册"
+              Write-Host "::error::（或被裹进了某个平台专属的 #ifdef），于是设了 env 只是把 GUI 启动起来"
+              exit 1
+            }
+            if ($p.ExitCode -ne 0) {
+              if (Test-Path $out) { Get-Content $out }
+              Write-Host "::error::$t 失败（exit=$($p.ExitCode)）"
+              exit 1
+            }
+          }
+
+      - name: Stage portable app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $stage = Join-Path $pwd $env:STAGE_DIR
+          # 扁平自包含：Coast.exe 直接放包根，无 clashauto-c++/Clashr-Auto 子目录（资源已内嵌 exe）。
+          # ★ 静态 Qt 之后这一步只剩一次 Copy-Item。原先这里有三段东西，全部消失了：
+          #     · windeployqt（拷 Qt6*.dll + platforms/ + plugins/ + qml/，上百个文件）
+          #     · 手工拷 MSVC 运行库（--compiler-runtime 实测不落 msvcp140_1/_2.dll，
+          #       未装 VC++ redist 的机器启动即 0xC0000135，真机验证过）
+          #     · sqldrivers\qsqlite.dll 在不在的警告
+          #   它们现在全在 exe 里。**别因为"以前有"就加回来**：静态构建下 windeployqt 在一个
+          #   没有 Qt 依赖的 exe 上找不到任何东西可拷，然后成功退出、什么也不做 —— 看上去一切正常。
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item "$env:BUILD_DIR\Release\Coast.exe" $stage -Force
+          if (-not (Test-Path "$stage\Coast.exe")) { throw "Missing staged executable" }
+          "{0:N1} MB  Coast.exe" -f ((Get-Item "$stage\Coast.exe").Length / 1MB)
+
+          # ★ 断言「真的没有外部依赖」。只数包里有几个 DLL 是不够的 —— 要问的是**导入表**里
+          #   还有没有非系统 DLL。dumpbin 是 MSVC 自带的。任何 Qt6*/msvcp*/vcruntime* 出现在
+          #   这里，都说明静态化在某处没生效；而那种包在装了 VS 的开发机上完全正常，
+          #   只在用户机器上打不开（0xC0000135），CI 全绿。
+          $dumpbin = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+                      Select-Object -First 1 -ExpandProperty FullName)
+          if ($dumpbin) {
+            $deps = & $dumpbin /nologo /dependents "$stage\Coast.exe" |
+                    ForEach-Object { if ($_ -match '^\s{4}(\S+\.dll)\s*$') { $matches[1] } }
+            Write-Host "Coast.exe 导入表: $($deps -join ', ')"
+            $bad = $deps | Where-Object { $_ -match '(?i)^(Qt6|msvcp|vcruntime|libcrypto|libssl)' }
+            if ($bad) {
+              Write-Host "::error::静态化没生效 —— Coast.exe 仍依赖 $($bad -join ', ')"
+              exit 1
+            }
+          } else {
+            Write-Host "::warning::找不到 dumpbin，跳过导入表检查"
+          }
+
+          # 包里除了 Coast.exe（和随后放进来的 core.exe）不该再有任何 DLL。
+          $stray = Get-ChildItem $stage -Recurse -Filter *.dll -ErrorAction SilentlyContinue
+          if ($stray) {
+            Write-Host "::error::包里出现了不该有的 DLL: $($stray.Name -join ', ')"
+            exit 1
+          }
+
+      - name: Bundle latest stable core
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          # 打包默认集成最新**正式版**内核到包根 core.exe；首次运行由
+          # CoreController::seedBundledCore() 落位到 userDir\command\core.exe（缺了才补，
+          # 绝不覆盖），之后的版本管理仍归应用内下载/更新。挑选规则与应用内 CoreRelease.h
+          # 一字不差：走 /releases 全量列表（不能用 /releases/latest——fork 从上游继承了
+          # 一堆零资产空 tag，latest 常正好落在那上面）、跳过 draft/prerelease、
+          # 必须真带本平台产物才认。下载失败**打包当场失败**——默认集成的包缺内核是静默劣化。
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+          $releases = Invoke-RestMethod -Uri "https://api.github.com/repos/ClashrAuto/clash/releases?per_page=20" -Headers $headers
+          $asset = $null
+          foreach ($r in $releases) {
+            if ($r.draft -or $r.prerelease) { continue }
+            foreach ($p in "${{ matrix.core_prefixes }}".Split(',')) {
+              $asset = @($r.assets | Where-Object { $_.name.StartsWith($p) -and $_.name.EndsWith(".zip") })[0]
+              if ($asset) { break }
+            }
+            if ($asset) { break }
+          }
+          if (-not $asset) { throw "正式版通道里没有 ${{ matrix.core_prefixes }} 产物" }
+          Write-Host "集成内核: $($asset.name)"
+          $tmp = Join-Path $env:RUNNER_TEMP "core-bundle"
+          New-Item -ItemType Directory -Force $tmp | Out-Null
+          # 下载直链不带 Authorization：它 302 到对象存储，多带一层凭据可能被拒
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$tmp\core.zip"
+          Expand-Archive -Path "$tmp\core.zip" -DestinationPath "$tmp\x" -Force
+          $exe = Get-ChildItem "$tmp\x" -Recurse -Filter *.exe | Select-Object -First 1
+          if (-not $exe) { throw "内核 zip 里没有 exe" }
+          Copy-Item $exe.FullName "$env:STAGE_DIR\core.exe" -Force
+          if (-not (Test-Path "$env:STAGE_DIR\core.exe")) { throw "core.exe 未落到包根" }
+          # ★ 真的把集成内核跑一下（只有 x64 能跑：arm64 是在 x64 上交叉编译的）。
+          # 原先只验「文件在不在」，从没执行过它。下载损坏、架构挑错（普通 amd64 是
+          # GOAMD64=v3，老 CPU/虚拟机直接 0xC0000005）、上游改产物命名，都会一路进发布包，
+          # 而 CI 全绿；用户那边只看到「什么都连不上」。
+          # 顺带把版本打进日志：取内核与 clash 发布之间有竞态（1.0.969 就取到了只带一半
+          # 修复的 v1.10.4413），版本号在日志里，事后能一眼看出来。
+          if ('${{ matrix.arch }}' -eq 'x64') {
+            # ⚠️ 这段刻意**不致命**（只告警，不 throw），理由是踩过一次坑：
+            # 2026-08-07 第一版写成 `& core.exe -v 2>&1 | Select-Object -First 1` 并在失败时
+            # throw，把 Windows x64 整条流水线弄红了——而 Linux 那条走 bash 不受影响，
+            # 于是只红了一半：Windows 包没产出、version.json 与 macOS 触发被跳过，
+            # 那次发布只有 16 个资产。日志需要仓库 admin 才能拉，当时无法确诊。
+            #
+            # 已知的两个 PowerShell 坑（本步骤开着 $ErrorActionPreference = "Stop"）：
+            #   · 对原生程序用 `2>&1`：stderr 每行会变成 NativeCommandError，
+            #     Stop 之下即使退出码是 0 也当场抛出；
+            #   · 在原生命令后直接接 `| Select-Object -First 1`：会提前中断上游管道。
+            # 所以这里先把 ErrorActionPreference 放开、把输出收进变量，再取首行。
+            #
+            # 权衡：**打包不能被一个自己都诊断不了的检查挡住**。真正的硬门禁留在 Linux
+            # 那条（那边是 bash，已验证可用）；Windows 这边保留最有价值的部分——
+            # 把内核版本打进日志，好在事后一眼看出「取内核与 clash 发布的竞态」。
+            $prev = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            $out = & "$env:STAGE_DIR\core.exe" -v
+            $rc = $LASTEXITCODE
+            $ErrorActionPreference = $prev
+            if ($rc -ne 0) {
+              Write-Warning "集成内核跑不起来（exit=$rc）——不阻断打包，但请人工确认"
+            } else {
+              Write-Host "集成内核自报版本: $($out | Select-Object -First 1)"
+            }
+          }
+
+      - name: Create portable zip
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "$env:STAGE_DIR\*" -DestinationPath "dist\Coast-$env:APP_VERSION-windows-${{ matrix.arch }}-portable.zip" -Force
+
+      # ────────────────────────────────────────────────────────────────────────────
+      # 自制安装器（clashauto-c++/installer/，2026-08-09 取代 NSIS）。
+      # 三步：造宿主 mkpkg → 断言三个非 Qt 产物没有 CRT 依赖 + UI 能加载 QML → 打包。
+      # 设计与踩坑全在 installer/CMakeLists.txt 与 core/*.h 的注释里。
+      # ────────────────────────────────────────────────────────────────────────────
+      - name: Build installer host tool (mkpkg)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # ★ mkpkg 必须是**宿主架构**：arm64 腿的主构建产出的是 arm64 exe，在 x64 runner 上
+          #   直接 0xC000007B 起不来。所以单独配一次 -A x64。x64 腿也走同一条路径 ——
+          #   多花二十来秒，换掉一个「按架构分叉」的 if，日志两条腿也长得一样。
+          cmake -S clashauto-c++/installer -B build-mkpkg -G "Visual Studio 17 2022" -A x64 `
+                -DCOAST_INSTALLER_HOST_ONLY=ON -DAPP_VERSION=$env:APP_VERSION
+          cmake --build build-mkpkg --config Release
+          if (-not (Test-Path "build-mkpkg\Release\mkpkg.exe")) { throw "mkpkg 没编出来" }
+
+      - name: Installer guards (no-CRT imports / QML loads)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $inst = Join-Path $env:BUILD_DIR "installer\Release"
+          foreach ($f in @('CoastSetup.exe','uninstall.exe','CoastSetupUI.exe')) {
+            if (-not (Test-Path "$inst\$f")) { throw "安装器产物缺失: $f" }
+          }
+
+          # ★ 三个非 Qt 产物必须**只依赖系统 DLL**。安装器是唯一一个要在「还什么都没装」的
+          #   机器上跑起来的程序 —— 它没有兜底：缺 vcruntime140.dll 就是双击后 0xC0000135，
+          #   而开发机与 runner 都装着 VC 运行库，看不出任何异常。
+          #   CoastSetupUI.exe 同样要过：它由 stub 从 %TEMP% 解出来单独跑，身边一个 DLL 都没有。
+          $dumpbin = (Get-ChildItem "C:\Program Files\Microsoft Visual Studio\2022\*\VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe" -ErrorAction SilentlyContinue |
+                      Select-Object -First 1 -ExpandProperty FullName)
+          if ($dumpbin) {
+            foreach ($f in @('CoastSetup.exe','uninstall.exe','CoastSetupUI.exe')) {
+              $deps = & $dumpbin /nologo /dependents "$inst\$f" |
+                      ForEach-Object { if ($_ -match '^\s{4}(\S+\.dll)\s*$') { $matches[1] } }
+              Write-Host "$f 导入表: $($deps -join ', ')"
+              $bad = $deps | Where-Object { $_ -match '(?i)^(Qt6|msvcp|vcruntime|api-ms-win-crt|libgcc|libstdc)' }
+              if ($bad) {
+                Write-Host "::error::$f 仍依赖 $($bad -join ', ') —— 静态 CRT 没生效，用户机上会 0xC0000135"
+                exit 1
+              }
+            }
+          } else {
+            Write-Host "::warning::找不到 dumpbin，跳过安装器导入表检查"
+          }
+
+          # ★ QML 冒烟测试。静态构建下 QML 插件靠链接期导入（qt_import_qml_plugins），
+          #   漏掉**不会有任何编译或链接错误** —— 只会在用户机上表现为「安装器双击打不开」，
+          #   而那时包已经发出去了。--selftest 只验 loadFromModule 能不能成，毫秒级。
+          #   （arm64 是交叉编译，runner 上跑不了它的产物。）
+          if ('${{ matrix.arch }}' -eq 'x64') {
+            $env:QT_ASSUME_STDERR_HAS_CONSOLE = '1'   # GUI 子系统的 Qt 日志否则走 OutputDebugString，CI 里什么都看不见
+            $out = Join-Path $env:RUNNER_TEMP "setupui-selftest.out"
+            $errf = Join-Path $env:RUNNER_TEMP "setupui-selftest.err"
+            $p = Start-Process -FilePath "$inst\CoastSetupUI.exe" -ArgumentList '--selftest' `
+                               -PassThru -NoNewWindow -RedirectStandardOutput $out -RedirectStandardError $errf
+            if (-not $p.WaitForExit(30000)) {
+              try { $p.Kill() } catch {}
+              Write-Host "::error::CoastSetupUI --selftest 30 秒未退出"
+              exit 1
+            }
+            if ($p.ExitCode -ne 0) {
+              # ★ 失败时把两条流都倒出来，再带 QML_IMPORT_TRACE=1 复跑一遍把 import 解析现场
+              #   打出来。第一次红灯时只有一句 "failed to load component"，连缺哪个模块都不知道，
+              #   白烧了一整轮 CI —— 这几行就是那一轮的学费。
+              foreach ($f in @($out, $errf)) { if (Test-Path $f) { Get-Content $f } }
+              $env:QML_IMPORT_TRACE = '1'
+              $t = Join-Path $env:RUNNER_TEMP "setupui-trace.out"
+              $q = Start-Process -FilePath "$inst\CoastSetupUI.exe" -ArgumentList '--selftest' `
+                                 -PassThru -NoNewWindow -RedirectStandardOutput $t -RedirectStandardError "$t.err"
+              $q.WaitForExit(30000) | Out-Null
+              foreach ($f in @($t, "$t.err")) { if (Test-Path $f) { Get-Content $f | Select-Object -Last 80 } }
+              Write-Host "::error::CoastSetupUI --selftest 失败（exit=$($p.ExitCode)）—— QML 模块没链进来"
+              exit 1
+            }
+            Write-Host "CoastSetupUI --selftest 通过"
+
+            # 原生（非 Qt）那些话的语言表：20 句 × 13 语言 = 260 格。用它的有三处 ——
+            # stub 的启动图（QML 窗口出来之前一直显示）、卸载确认框（整个卸载流程唯一的界面）、
+            # 以及**安装进度条上方那一串**（真正在装的那几十秒里用户只看它，虽然显示在 QML
+            # 窗口里，产生它的 core/Install.cpp 却不链 Qt）。漏填一格只表现为「某种语言下
+            # 那句话不见了」，只有装在那个语种的机器上才看得见。
+            $nsout = Join-Path $env:RUNNER_TEMP "ns-selftest.out"
+            $np = Start-Process -FilePath "$inst\uninstall.exe" -ArgumentList '--selftest' `
+                                -PassThru -NoNewWindow -RedirectStandardOutput $nsout
+            if (-not $np.WaitForExit(30000)) {
+              try { $np.Kill() } catch {}
+              Write-Host "::error::uninstall --selftest 30 秒未退出"
+              exit 1
+            }
+            if ($np.ExitCode -ne 0) {
+              if (Test-Path $nsout) { Get-Content $nsout }
+              Write-Host "::error::原生语言表自检失败（exit=$($np.ExitCode)）"
+              exit 1
+            }
+            Write-Host "uninstall --selftest（原生语言表）通过"
+          }
+
+      - name: Create installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $inst    = Join-Path $env:BUILD_DIR "installer\Release"
+          $payload = Join-Path $env:RUNNER_TEMP "setup-app"
+          $boot    = Join-Path $env:RUNNER_TEMP "setup-boot"
+          Remove-Item -Recurse -Force $payload, $boot -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force $payload, $boot | Out-Null
+
+          # 应用负载 = 便携包的内容（Coast.exe + core.exe）**再加** uninstall.exe。
+          # ★ uninstall.exe 只进安装包，不进便携 zip：便携版没有「安装」这回事，
+          #   放一个卸载器进去只会让人点了之后删掉自己解压的目录。
+          Copy-Item "$env:STAGE_DIR\*" $payload -Recurse -Force
+          Copy-Item "$inst\uninstall.exe" $payload -Force
+          # 引导子集 = CoastSetupUI.exe 一个文件。静态 Qt 的红利：SChat 那边要对界面 exe
+          # 单独跑一次 windeployqt 把整棵树当引导子集，还得防它随 Qt 升级悄悄过期。
+          Copy-Item "$inst\CoastSetupUI.exe" $boot -Force
+
+          $out = "dist\Coast-$env:APP_VERSION-windows-${{ matrix.arch }}-setup.exe"
+          & "build-mkpkg\Release\mkpkg.exe" --stub "$inst\CoastSetup.exe" `
+              --app $payload --boot $boot --out $out --version $env:APP_VERSION
+          if ($LASTEXITCODE -ne 0) { throw "mkpkg 失败（exit=$LASTEXITCODE）" }
+          if (-not (Test-Path $out)) { throw "安装包没产出: $out" }
+          "{0:N1} MB  $out" -f ((Get-Item $out).Length / 1MB)
+
+      - name: Installer smoke test (silent install + uninstall)
+        # ★ 真的装一遍再卸一遍。「文件在不在包里」挡不住的失败方式太多了：包尾 footer 对不上、
+        #   索引串位、目标被占用时的挪开重试、ARP 键写错视图、收尾进程删不掉目录 ——
+        #   每一种都会让 CI 全绿而用户装完打不开或卸不干净。
+        #   /S /D= 走的正是更新器一键升级那条路径，所以这一步同时也是**更新链路**的门禁。
+        #   （arm64 交叉编译，产物在 x64 runner 上跑不了。）
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $setup = "dist\Coast-$env:APP_VERSION-windows-x64-setup.exe"
+          $root  = Join-Path $env:RUNNER_TEMP "coast-install-test"
+          Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+
+          # ⚠️ /D= 必须是最后一个参数、不带引号 —— 与 NSIS 语义一字不差，
+          #    UpdateController::launchSilentUpdateAndRestart 拼的就是这个形状。
+          $p = Start-Process -FilePath (Resolve-Path $setup).Path -ArgumentList '/S', "/D=$root" -PassThru -NoNewWindow
+          if (-not $p.WaitForExit(180000)) { try { $p.Kill() } catch {}; throw "静默安装 3 分钟未结束" }
+          $log = Join-Path $env:TEMP "coast-setup.log"
+          if (Test-Path $log) { Get-Content $log }
+          if ($p.ExitCode -ne 0) { throw "静默安装失败（exit=$($p.ExitCode)）" }
+
+          foreach ($f in @('Coast.exe','core.exe','uninstall.exe')) {
+            if (-not (Test-Path (Join-Path $root $f))) { throw "装完少了 $f" }
+          }
+          $arp = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Coast'
+          $ver = (Get-ItemProperty $arp -Name DisplayVersion -ErrorAction SilentlyContinue).DisplayVersion
+          if ($ver -ne $env:APP_VERSION) { throw "ARP DisplayVersion=$ver，期望 $env:APP_VERSION" }
+          Write-Host "静默安装通过（ARP 版本 $ver）"
+
+          # 卸载。删目录由 uninstall.exe 复制到 %TEMP% 的那份收尾进程异步做 —— 轮询等它。
+          $u = Start-Process -FilePath (Join-Path $root 'uninstall.exe') -ArgumentList '/S' -PassThru -NoNewWindow
+          if (-not $u.WaitForExit(120000)) { try { $u.Kill() } catch {}; throw "静默卸载 2 分钟未结束" }
+          if ($u.ExitCode -ne 0) { throw "静默卸载失败（exit=$($u.ExitCode)）" }
+          $gone = $false
+          foreach ($i in 1..60) { if (-not (Test-Path $root)) { $gone = $true; break }; Start-Sleep -Milliseconds 500 }
+          if (-not $gone) { throw "卸载后安装目录仍在: $root（收尾进程没干活）" }
+          if (Test-Path $arp) { throw "卸载后 ARP 注册项仍在" }
+          Write-Host "静默卸载通过"
+
+      - name: Generate SHA256 sidecars
+        shell: pwsh
+        run: |
+          # 为每个发布物生成 <文件>.sha256（仅十六进制摘要）。应用更新时直连 GitHub
+          # 取该边车校验安装包完整性——即使经 ghfast.top 镜像下载正文，摘要仍来自官方源，
+          # 镜像无法在不被发现的情况下投递木马。边车随 dist/Coast-* 一并上传。
+          Get-ChildItem dist -Filter 'Coast-*' -File | Where-Object { $_.Extension -ne '.sha256' } | ForEach-Object {
+            (Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower() | Out-File -FilePath "$($_.FullName).sha256" -Encoding ascii -NoNewline
+          }
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coast-windows-${{ matrix.arch }}
+          path: |
+            dist/Coast-*-windows-${{ matrix.arch }}-portable.zip
+            dist/Coast-*-windows-${{ matrix.arch }}-setup.exe
+
+      - name: Write release notes
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: printf '%s\n' "$COMMIT_MSG" > release-notes.md
+
+      - name: Upload to GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          # 名字带上分支，便于在 Release 列表里一眼分辨这是哪条分支的测试版。
+          # ★ 资源文件名 Coast-<ver>-<平台>-<架构>-…（旧名 ClashAuto-*，2026-08 统一改成品牌名）。
+          #   改前缀是安全的：app 的一键更新按文件名里的**平台/架构**挑资源，不认前缀
+          #   （UpdateController::recommendedIndex / UpdateChecker.macAsset），老版本照样能更新。
+          name: ${{ env.IS_PRERELEASE == 'true' && format('Coast {0} (beta · {1})', env.APP_VERSION, env.SOURCE_REF) || format('Coast {0}', env.APP_VERSION) }}
+          prerelease: ${{ env.IS_PRERELEASE == 'true' }}
+          target_commitish: ${{ github.sha }}
+          # 更新说明 = 触发本次构建的提交说明（app 内更新弹窗直接展示），经上一步写盘的
+          # 文件传入。不能用 generate_release_notes：创建 release 时 GitHub 会把「提供的
+          # body + 自动说明」合并，body 里的部分换行被转义成字面 \n；后续 job 的 body_path
+          # 更新又会覆盖掉自动说明——它只留下污染的中间态，纯负作用，故移除。
+          body_path: release-notes.md
+          # prerelease 绝不能占 latest：/releases/latest 是正式版通道，被 beta 占了会把所有
+          # 没开「接收测试版」的用户推到测试版上去。
+          make_latest: ${{ env.IS_PRERELEASE == 'true' && 'false' || 'true' }}
+          overwrite_files: true
+          files: |
+            dist/Coast-*
+
+  macos:
+    name: macOS universal Qt (x86_64 + arm64)
+    # ★★ 2026-08-02 重新启用：mac 上 **两条腿并存**，用户在 release 里二选一。
+    #      · Swift 版（macos-swift job）—— 部署目标 macOS 26，整套界面建在 Liquid Glass 上，
+    #        产物 Coast-<ver>-macos-universal.dmg（外部仓库签名公证后 clobber 上来）。
+    #      · Qt 版（本 job）—— 部署目标 13.0、Intel + Apple Silicon 胖包，产物名带 **-qt**：
+    #        Coast-<ver>-macos-universal-qt.dmg。这条腿解决「macOS 26 以下装不上」。
+    #
+    #    两个 .dmg 落在同一个 release 上，所以**产物名里的 -qt 是刚性契约**：
+    #    Swift 的 AppUpdater.pickAsset / UpdateChecker.macAsset 按 `-qt` 排除，
+    #    Qt 的 UpdateController::recommendedIndex 反过来优先挑它 —— 两条线各更各的，
+    #    绝不互相串包（去掉 -qt 就等于让用户随机被推到另一条线上）。
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+          fetch-depth: 0
+
+      - name: Resolve build version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 基线 major.minor 取自 CMakeLists，构建号用 git 提交数自动递增（每次提交 +1）
+          # [[:space:]] 而非 \s：macOS 的 BSD sed 不支持 \s（GNU sed 两种都认）
+          base="$(sed -nE 's/.*project[[:space:]]*\([[:space:]]*[^ ]+[[:space:]]+VERSION[[:space:]]+([0-9]+(\.[0-9]+){1,3}).*/\1/p' clashauto-c++/CMakeLists.txt | head -n 1)"
+          if [ -z "$base" ]; then
+            echo "Cannot find project VERSION in clashauto-c++/CMakeLists.txt" >&2
+            exit 1
+          fi
+          major="$(echo "$base" | cut -d. -f1)"
+          minor="$(echo "$base" | cut -d. -f2)"
+          [ -n "$minor" ] || minor=0
+          build="$(git rev-list --count HEAD)"
+          version="${major}.${minor}.${build}"
+          # 主分支 = 正式版，其余分支 = prerelease。取舍见 windows job 那段注释。
+          if [ "${{ github.ref }}" = "refs/heads/master" ] || [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            is_pre=false; tag="v$version"
+          else
+            is_pre=true; tag="v$version-beta.$(echo "${{ github.sha }}" | cut -c1-7)"
+          fi
+          {
+            echo "APP_VERSION=$version"
+            echo "RELEASE_TAG=$tag"
+            echo "IS_PRERELEASE=$is_pre"
+          } >> "$GITHUB_ENV"
+          echo "Release version: $version tag=$tag prerelease=$is_pre (build number = commit count)"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ninja
+          # pillow 用来从 icon.ico 生成 icns；aqtinstall 不再需要（Qt 改为自己编的静态版）。
+          python3 -m pip install --user pillow \
+            || python3 -m pip install --user --break-system-packages pillow
+
+      - name: Static Qt (universal)
+        id: qt
+        # ★ Qt 自己也必须是通用二进制：app 那侧 -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
+        #   链到单架构静态库会当场失败 —— 本仓库在 brew 的 libcrypto 上正是这么栽的
+        #   （CMakeLists 顶部那段注释记着）。extra-cmake 在 qt-static.yml 里同样传，两处必须一致。
+        uses: ./.github/actions/qt-static
+        with:
+          qt-version: ${{ env.QT_VERSION }}
+          target: macos-universal
+          extra-cmake: '-DCMAKE_OSX_ARCHITECTURES=x86_64;arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0'
+
+      - name: Export Qt root
+        shell: bash
+        run: echo "QT_ROOT=${{ steps.qt.outputs.qt-root }}" >> "$GITHUB_ENV"
+
+      - name: Generate icon.icns
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 从 assets/icon.ico 取最大帧生成 iconset → icns；CMake 检测到该文件即打进 Resources
+          python3 - <<'PY'
+          from PIL import Image
+          import pathlib
+
+          ico = Image.open("clashauto-c++/assets/icon.ico")
+          sizes = sorted(ico.info.get("sizes") or {ico.size})
+          ico.size = sizes[-1]
+          ico.load()
+          base = ico.convert("RGBA")
+          out = pathlib.Path("icon.iconset")
+          out.mkdir(exist_ok=True)
+          for s in (16, 32, 128, 256, 512):
+              base.resize((s, s), Image.LANCZOS).save(out / f"icon_{s}x{s}.png")
+              base.resize((s * 2, s * 2), Image.LANCZOS).save(out / f"icon_{s}x{s}@2x.png")
+          PY
+          iconutil -c icns -o clashauto-c++/assets/icon.icns icon.iconset
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S clashauto-c++ -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAPP_VERSION="$APP_VERSION" \
+            -DCMAKE_PREFIX_PATH="$QT_ROOT" \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+
+      - name: Build
+        shell: bash
+        run: cmake --build "$BUILD_DIR" --parallel
+
+      - name: Verify universal binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="$BUILD_DIR/Coast.app/Contents/MacOS/Coast"
+          lipo -archs "$bin"
+          lipo -archs "$bin" | grep -q x86_64
+          lipo -archs "$bin" | grep -q arm64
+          # ★ 断言「Qt 真的不在依赖里了」。otool -L 看的是实际会被加载的东西，比数文件可靠。
+          #   任何 QtCore.framework / libQt6* 出现在这里都说明静态化没生效 —— 而那种 .app
+          #   在构建机上照跑（机器上有 Qt），只有用户的机器会打不开。
+          echo "—— Coast 的动态依赖 ——"
+          otool -L "$bin"
+          if otool -L "$bin" | grep -qE 'Qt[A-Za-z0-9]+\.framework|libQt6'; then
+            echo "::error::静态化没生效 —— Coast 仍动态依赖 Qt"
+            exit 1
+          fi
+
+      - name: Static plugin self-test
+        shell: bash
+        # 静态构建下 TLS 后端 / QSQLITE / 图片格式 / QML 模块靠链接期导入，漏了不报任何
+        # 编译或链接错误。这是 mac 这条腿唯一能证明它们真被链进来的地方。
+        # macos-14 是 arm64 runner，跑通用二进制的 arm64 那半。
+        run: |
+          set -euo pipefail
+          bin="$BUILD_DIR/Coast.app/Contents/MacOS/Coast"
+          QT_QPA_PLATFORM=offscreen COAST_STATICDEPS_SELFTEST=1 "$bin"
+          # 控制端点这条链路。mac 这条腿要跑的理由与 Windows 同源但不同因：这里的传输层是
+          # unix socket，而 .app 里的进程还多一层「自搬迁到 /Applications」的分支 ——
+          # MacRelocate 对任何 COAST_*SELFTEST 都会早退（见 CLAUDE.md），这几条正好一并守住
+          # 那条早退路径：它要是哪天失效，表现是自测弹一个模态框然后把 runner 挂到超时。
+          # ★ 每条都要有 30 秒上限：钩子没注册时的表现是「GUI 正常启动、永不退出」，
+          #   不设上限就是一条挂到 job 上限（6 小时）的死等（本仓库栽过四次）。
+          # ★ **不能用 `timeout`**：那是 GNU coreutils 的，macOS 不带；runner 上装了 coreutils
+          #   也只提供 `gtimeout`。写 `timeout` 的话这一步会以 "command not found" 失败 ——
+          #   一条与被测对象毫无关系的红鲱鱼。所以这里用后台进程 + 轮询的自建看门狗，
+          #   不依赖任何外部命令。
+          run_hook() {
+            local t="$1" out rc i
+            out="$RUNNER_TEMP/$t.out"
+            env QT_QPA_PLATFORM=offscreen "$t=1" "$bin" >"$out" 2>&1 &
+            local pid=$!
+            for i in $(seq 1 60); do
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 0.5
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+              kill -9 "$pid" 2>/dev/null || true
+              sed 's/^/      /' "$out" || true
+              echo "::error::$t 30 秒未退出 —— 多半是钩子没注册，或 MacRelocate 的自测早退失效了"
+              return 1
+            fi
+            set +e; wait "$pid"; rc=$?; set -e
+            if [ "$rc" != 0 ]; then
+              sed 's/^/      /' "$out" || true
+              echo "::error::$t 失败（exit=$rc）"
+              return 1
+            fi
+            echo "PASS  $t"
+          }
+          for t in COAST_CONTROLAPI_SELFTEST COAST_CONTROLSERVER_SELFTEST \
+                   COAST_MCP_SELFTEST COAST_CONFIGVALIDATE_SELFTEST \
+                   COAST_CONFIRM_SELFTEST COAST_RULEEXPLAIN_SELFTEST \
+                   COAST_CHANGELOG_SELFTEST COAST_NODEHEALTH_SELFTEST \
+                   COAST_SCHEDULE_SELFTEST; do
+            run_hook "$t"
+          done
+
+      - name: Gateway self-test (feth)
+        shell: bash
+        # 用 feth 对 + 真实 BPF 端点跑一遍网关 headless 自测（不阻塞发布；失败作可见告警）。
+        continue-on-error: true
+        run: sudo bash validate/gateway_selftest_mac.sh "$BUILD_DIR/Coast.app/Contents/MacOS/Coast"
+
+      - name: Bundle latest stable core
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # 与 windows/linux 两条腿同一套规则：/releases 全量列表（不能用 /releases/latest
+          # ——fork 从上游继承了一堆零资产空 tag）、跳过 draft/prerelease、必须真带本平台产物。
+          # 落到 Contents/Resources/core，首次运行由 CoreController::seedBundledCore() 落位到
+          # userDir/command/core（缺了才补，绝不覆盖）。
+          # ★ 这一步是**在签名之前**跑的：往已签名的 .app 里塞文件会当场破坏封存。
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            'https://api.github.com/repos/ClashrAuto/clash/releases?per_page=20' -o /tmp/core-releases.json
+          pick() {  # 参数 = 产物名前缀（按优先级），打印下载直链
+            python3 - /tmp/core-releases.json "$@" <<'PY'
+          import json, sys
+          releases = json.load(open(sys.argv[1]))
+          for release in releases:
+              if release.get("draft") or release.get("prerelease"):
+                  continue
+              for prefix in sys.argv[2:]:
+                  for asset in release.get("assets", []):
+                      name = asset.get("name", "")
+                      if name.startswith(prefix) and name.endswith(".gz"):
+                          print(asset["browser_download_url"])
+                          sys.exit(0)
+          sys.exit(1)
+          PY
+          }
+          fetch() {  # $1 = 输出文件，其余 = 前缀
+            local out="$1"; shift
+            local url
+            url="$(pick "$@")" || { echo "正式版通道里没有 $* 产物" >&2; return 1; }
+            echo "集成内核: $(basename "$url")"
+            # 下载直链不带 Authorization：它 302 到对象存储，多带一层凭据可能被拒
+            curl -fsSL --retry 3 "$url" | gunzip > "$out"
+            test -s "$out"
+          }
+          # amd64 优先 -compatible（v1 基线）：普通 amd64 产物是 GOAMD64=v3，老 Intel 机
+          # 直接非法指令崩 —— 与 CoreRelease.h / make_app.sh 的挑选顺序一字不差。
+          fetch /tmp/core-arm64 "coast-darwin-arm64-"
+          fetch /tmp/core-amd64 "coast-darwin-amd64-compatible-" "coast-darwin-amd64-v1-"
+          # Go 二进制可以直接 lipo —— 和 .app 的两架构对齐，哪半跑就用哪半。
+          mkdir -p "$BUILD_DIR/Coast.app/Contents/Resources"
+          lipo -create /tmp/core-arm64 /tmp/core-amd64 \
+            -output "$BUILD_DIR/Coast.app/Contents/Resources/core"
+          chmod 755 "$BUILD_DIR/Coast.app/Contents/Resources/core"
+          lipo -archs "$BUILD_DIR/Coast.app/Contents/Resources/core"
+
+      # 导入 Developer ID 证书到临时 keychain（仅当设置了 secret；否则回退 ad-hoc，fork 仍能编）。
+      # 复用 schat.build/qt-desktop.yml 的做法，凭据同名 secret（Team 6AXTRT5TV4）。
+      - name: Import Developer ID signing cert
+        id: signcert
+        shell: bash
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PW }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12:-}" ]; then
+            echo "MACOS_CERT_P12 未设置 — 回退 ad-hoc 签名"; echo "identity=-" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          KC="$RUNNER_TEMP/sign.keychain-db"; KPW="$(openssl rand -base64 18)"
+          security create-keychain -p "$KPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KPW" "$KC"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "${CERT_PW:-}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$KC" >/dev/null
+          # 让临时 keychain 与默认 keychain 一起可搜，codesign 才能找到身份
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed 's/"//g')
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" | grep -m1 "Developer ID Application" | sed -E 's/.*"(.*)".*/\1/')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          [ -n "$IDENTITY" ] || { echo "导入的证书里没有 Developer ID Application 身份"; exit 1; }
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+          echo "imported identity: $IDENTITY"
+
+      - name: Stage app bundle
+        shell: bash
+        env:
+          SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
+        run: |
+          set -euo pipefail
+          APP="$BUILD_DIR/Coast.app"
+          # ★ 这里原本有一行 macdeployqt：把 Qt 的 framework 拷进 Contents/Frameworks、
+          #   插件拷进 Contents/PlugIns、再 install_name_tool 改写一堆加载路径。
+          #   静态 Qt 之后 .app 里没有任何 Qt 产物，这一步整个不需要了。
+          #   **别加回来**：macdeployqt 在一个没有 Qt 依赖的可执行文件上会成功退出、什么也不做，
+          #   看上去一切正常；但它顺手做的 install_name_tool 改写仍会破坏更早的签名。
+          # 嵌入特权 helper 与其 launchd plist。helper 独立可执行由 CMake 构建在
+          # $BUILD_DIR 根下（OUTPUT_NAME），universal。
+          mkdir -p "$APP/Contents/Library/LaunchDaemons"
+          cp "$BUILD_DIR/com.yuehongsun.coast.helper" "$APP/Contents/MacOS/com.yuehongsun.coast.helper"
+          cp "clashauto-c++/helper/com.yuehongsun.coast.helper.plist" "$APP/Contents/Library/LaunchDaemons/"
+          lipo -archs "$APP/Contents/MacOS/com.yuehongsun.coast.helper"
+
+          # 资源已内嵌 exe(qrc)，不再往 bundle 塞 Contents/Clashr-Auto —— app 自包含。
+
+          # 签名（公证必需硬化运行时 + 安全时间戳）。必须在**所有内容都放进 bundle 之后**再签
+          # ——任何事后往 .app 里塞文件或改写加载路径都会破坏封存。（以前这条写的是
+          # "macdeployqt 之后再签"，静态化后那一步没了，但先放齐再签这个次序不变。）
+          # 关键：helper 必须用显式 -i 指定 identifier = com.yuehongsun.coast.helper（= launchd Label）。
+          # 否则 codesign 把可执行名末尾的「.helper」当扩展名剥掉，identifier 变成 com.yuehongsun.coast，
+          # 与注册 Label 不一致 → SMAppService daemon 启动即被 Launch Constraint Violation SIGKILL，核心无法 root。
+          # 用 --deep 一把签全（含 frameworks）会把 helper identifier 又剥回去，故末尾再单独 -i 重签 helper + 浅签 app 重新封存。
+          HELPER="$APP/Contents/MacOS/com.yuehongsun.coast.helper"
+          HELPER_ID="com.yuehongsun.coast.helper"
+          if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ]; then
+            codesign --force --deep --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+            codesign --force --options runtime --timestamp -i "$HELPER_ID" --sign "$SIGN_IDENTITY" "$HELPER"
+            codesign --force --options runtime --timestamp --sign "$SIGN_IDENTITY" "$APP"
+            echo "signed with: $SIGN_IDENTITY"
+          else
+            codesign --force --deep --sign - "$APP"                       # ad-hoc 兜底（无 cert secret）
+            codesign --force -i "$HELPER_ID" --sign - "$HELPER"
+            codesign --force --sign - "$APP"
+          fi
+          codesign --verify --deep --strict --verbose=2 "$APP" && echo "codesign verify OK"
+          codesign --verify --strict --verbose=2 "$HELPER" && echo "helper codesign verify OK"
+          echo "helper identity:"; codesign -dvv "$HELPER" 2>&1 | grep -Ei 'Identifier|TeamIdentifier'
+
+      - name: Create DMG
+        shell: bash
+        env:
+          SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # ★ 名字里的 -qt 不是装饰：同一个 release 上还躺着 Swift 版的
+          #   Coast-<ver>-macos-universal.dmg，两边的一键更新全靠这个子串区分。
+          DMG="dist/Coast-${APP_VERSION}-macos-universal-qt.dmg"
+          mkdir -p dist
+
+          # ── 自定义 Finder 布局的 dmg（「双击运行」）─────────────────────────────────
+          # 与外部签名仓库 integemjack/schat.build 的 clashauto-mac-qt.yml **必须保持一致**，
+          # 也与本文件里 Swift 那条腿的布局完全一致（同一张背景图、同一组坐标）。
+          # 本 job 出的只是 artifact，但 AppleScript 的语法错误能在这里就红。
+          #
+          # ⚠️ 窗口 bounds {200,120,740,500} = 540x380 点 ←→ 背景图 1080x760 @2x/144DPI；
+          #   图标位置 {270,150} = 背景图里凹槽的圆心。背景图由
+          #   clashauto-c++/scripts/make_dmg_background.py 生成，改坐标要一起改。
+          # ⚠️ 没有 /Applications 软链（刻意的「双击运行」）。从 dmg 直接运行时 App Translocation
+          #   会把 bundle 映射到随机只读路径、特权 helper 装不上 —— 这条由**应用自己**兜底：
+          #   不在 /Applications 就搬进去再重启（Qt: src/MacRelocate.mm，Swift: Sources/Coast/Relocate.swift）。
+          #   两件事是配套的，去掉任何一个都会让另一个变成 bug。
+          DMGSTAGE="$RUNNER_TEMP/dmg-stage"
+          rm -rf "$DMGSTAGE"; mkdir -p "$DMGSTAGE/.background"
+          ditto "$BUILD_DIR/Coast.app" "$DMGSTAGE/Coast.app"
+          if [ -f clashauto-c++/scripts/dmg-background.png ]; then
+            cp clashauto-c++/scripts/dmg-background.png "$DMGSTAGE/.background/bg.png"
+          else
+            echo "::warning::没有 dmg 背景图资产 —— 退化成朴素窗口"
+          fi
+          # ad-hoc（无证书）时才附「首次打开」引导；已公证的包无需，跳过。
+          # 它在窗口里排到右下角（AppleScript 里那句 set position 包了 try，文件不在就跳过）。
+          if [ -z "${SIGN_IDENTITY:-}" ] || [ "$SIGN_IDENTITY" = "-" ]; then
+          cat > "$DMGSTAGE/打开说明.txt" <<'EOF'
+          Coast（Qt 通用版：macOS 13+，Intel + Apple Silicon）
+
+          安装：把「Coast」拖到「应用程序」文件夹，然后从那里打开。
+
+          首次打开：本应用未经 Apple 公证，直接双击会被系统拦截。
+          方法一：在「应用程序」中右键点击「Coast」→ 打开 → 再点「打开」。
+          方法二：终端执行 xattr -cr "/Applications/Coast.app" 后正常双击。
+          EOF
+          fi
+          # ⚠️ 这个函数是在 `if ! ( layout_dmg )` 里调的，而 **`set -e` 在被当作条件求值的
+          #    命令里是失效的**（POSIX：-e 对 if/while/&&/||/! 的条件部分不生效，且递归作用到
+          #    函数体内）。所以每一步都要显式 `|| return 1` —— 靠 set -e 的话，中途失败会被
+          #    继续执行到末尾的 `rm -f "$RW"`（成功），函数遂返回 0，兜底那段**根本不会触发**。
+          #    实测代价：2026-08-10 一轮 mac 构建 convert 失败，日志里连一句「布局失败」都没有，
+          #    直接以「dmg 没生成」收尾，那一版少了一个平台的包。
+          layout_dmg() {
+            RW="$RUNNER_TEMP/coast-rw.dmg"
+            rm -f "$RW"
+            hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
+            hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDRW "$RW" || return 1
+            hdiutil attach "$RW" -noautoopen || return 1
+            sleep 2
+            osascript <<'OSA'
+          tell application "Finder"
+            tell disk "Coast"
+              open
+              set current view of container window to icon view
+              set toolbar visible of container window to false
+              set statusbar visible of container window to false
+              set the bounds of container window to {200, 120, 740, 500}
+              set vo to the icon view options of container window
+              set arrangement of vo to not arranged
+              set icon size of vo to 128
+              set text size of vo to 13
+              try
+                set background picture of vo to file ".background:bg.png"
+              end try
+              set position of item "Coast.app" of container window to {270, 150}
+              try
+                set position of item "打开说明.txt" of container window to {470, 320}
+              end try
+              update without registering applications
+              delay 1
+              close
+            end tell
+          end tell
+          OSA
+            sync
+            # Finder 写完 .DS_Store 后不一定立刻放手 —— 直接 detach 会 "Resource busy"，
+            # 而卷没卸干净时紧接着的 convert 必然 "Resource temporarily unavailable"。
+            # 先温和重试，实在不行再 -force。
+            detached=0
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if hdiutil detach "/Volumes/Coast" >/dev/null 2>&1; then detached=1; break; fi
+              sleep 2
+            done
+            if [ "$detached" -eq 0 ]; then
+              echo "::warning::detach 十次未成功，改用 -force"
+              hdiutil detach "/Volumes/Coast" -force || true
+              sleep 2
+            fi
+            if ! hdiutil convert "$RW" -format UDZO -o "$DMG" -ov; then
+              # 只有一行 "convert failed" 看不出是谁占着卷 —— 把挂载情况打出来。
+              echo "::warning::hdiutil convert 失败，当前挂载情况："
+              hdiutil info || true
+              return 1
+            fi
+            rm -f "$RW"
+            [ -f "$DMG" ] || return 1
+          }
+          rm -f "$DMG"
+          if ! ( layout_dmg ); then
+            echo "::warning::自定义 dmg 布局失败 —— 回退朴素 dmg"
+            rm -f "$DMG"
+            for attempt in 1 2 3 4; do
+              hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
+              hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDZO "$DMG" && break
+              echo "hdiutil create 失败（第 $attempt/4 次），8 秒后重试"; sleep 8
+            done
+          fi
+          [ -f "$DMG" ] || { echo "ERROR: dmg 没生成"; exit 1; }
+          # 公证 + staple：仅在真签名 + 有 notary 凭据时（Apple 拒绝 ad-hoc 提交）。
+          # 用 App Store Connect API Key(.p8)；失败则本步失败 → 不上传未公证的 dmg。
+          if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ] && [ -n "${NOTARY_KEY:-}" ]; then
+            echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/nkey.p8"
+            xcrun notarytool submit "$DMG" \
+              --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
+              --wait --timeout 45m
+            xcrun stapler staple "$DMG"
+            xcrun stapler validate "$DMG" && echo "notarized + stapled OK"
+            rm -f "$RUNNER_TEMP/nkey.p8"
+          else
+            # 本仓库通常没有这些凭据（拿不到、也不该拿到），走到这里是**正常路径**：
+            # 产出一个 ad-hoc 签名的 DMG 仅供本 run 下载排查。发布用的签名包由 schat.build 出。
+            echo "无 notary 凭据或 ad-hoc 签名 — 跳过公证（本 job 的 DMG 只作 artifact，不发布）"
+          fi
+
+      - name: Generate SHA256 sidecars
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 每个发布物生成 <文件>.sha256（仅摘要），供应用更新时直连 GitHub 校验完整性
+          for f in dist/Coast-*; do
+            case "$f" in *.sha256) continue;; esac
+            [ -f "$f" ] || continue
+            shasum -a 256 "$f" | awk '{print $1}' > "$f.sha256"
+          done
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coast-macos-universal-qt
+          path: |
+            dist/Coast-*-macos-universal-qt.dmg
+
+      # ★ 本 job **不往 Release 传任何东西**，只做「Qt mac 这条腿还编得过、结构没坏」的自检
+      #   + 留一份未签名 artifact 供排查。理由与 macos-swift 完全一样：本仓库的 CI 拿不到
+      #   Developer ID 私钥，也不该拿到。签名 + 公证 + 上传由外部仓库 integemjack/schat.build
+      #   的 clashauto-mac-qt.yml 做（由 trigger-mac job 推的 `product: coast-qt` 触发，
+      #   那边会自己 checkout 同一个 sha 重新构建一遍）。
+      #
+      #   发未公证的包比不发更糟：用户看到 release 里有 mac 包、下下来双击被 Gatekeeper 拦，
+      #   还找不到原因。所以宁可这里什么都不传。
+
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # core_prefixes：打包集成的内核产物名前缀（含义见 windows job 矩阵的注释）
+          - arch: x64
+            runner: ubuntu-22.04
+            deb_arch: amd64
+            core_prefixes: coast-linux-amd64-compatible-,coast-linux-amd64-v1-
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            deb_arch: arm64
+            core_prefixes: coast-linux-arm64-
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+          fetch-depth: 0
+
+      - name: Resolve build version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 基线 major.minor 取自 CMakeLists，构建号用 git 提交数自动递增（每次提交 +1）
+          # [[:space:]] 而非 \s：macOS 的 BSD sed 不支持 \s（GNU sed 两种都认）
+          base="$(sed -nE 's/.*project[[:space:]]*\([[:space:]]*[^ ]+[[:space:]]+VERSION[[:space:]]+([0-9]+(\.[0-9]+){1,3}).*/\1/p' clashauto-c++/CMakeLists.txt | head -n 1)"
+          if [ -z "$base" ]; then
+            echo "Cannot find project VERSION in clashauto-c++/CMakeLists.txt" >&2
+            exit 1
+          fi
+          major="$(echo "$base" | cut -d. -f1)"
+          minor="$(echo "$base" | cut -d. -f2)"
+          [ -n "$minor" ] || minor=0
+          build="$(git rev-list --count HEAD)"
+          version="${major}.${minor}.${build}"
+          # 主分支 = 正式版，其余分支 = prerelease。取舍见 windows job 那段注释。
+          if [ "${{ github.ref }}" = "refs/heads/master" ] || [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            is_pre=false; tag="v$version"
+          else
+            is_pre=true; tag="v$version-beta.$(echo "${{ github.sha }}" | cut -c1-7)"
+          fi
+          {
+            echo "APP_VERSION=$version"
+            echo "RELEASE_TAG=$tag"
+            echo "IS_PRERELEASE=$is_pre"
+          } >> "$GITHUB_ENV"
+          echo "Release version: $version tag=$tag prerelease=$is_pre (build number = commit count)"
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # ★ 静态 Qt 把这份清单从「运行时库」改成了「**链接期**开发包」，且**不能省** ——
+          #   共享构建时 libQt6XcbQpa.so 自己带着对 xcb 的依赖，我们只要拷过来；静态构建时
+          #   那些引用变成了主程序自己的未定义符号，链接期就要找到 libxcb.so 等实体。
+          #   ⚠️ 更要紧的是：这些包**不能只交给 qt-static 那个 action 去装**。它在缓存命中时
+          #      整个构建步骤都会跳过，apt 自然也不跑 —— 于是「第一次能编、第二次链接报一堆
+          #      undefined reference to xcb_*」，而两次的代码完全一样。所以这里独立装一份。
+          #   build-essential/cmake/ninja-build → 编译
+          #   fakeroot/zip                      → 打 .deb / 便携 zip
+          #   （patchelf 与 python3-pip 都不再需要：没有 Qt 运行时要拷、也不用 aqt 了）
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            fakeroot \
+            zip \
+            libgl1-mesa-dev libegl1-mesa-dev libglu1-mesa-dev \
+            libfontconfig1-dev libfreetype-dev \
+            libx11-dev libx11-xcb-dev libxext-dev libxfixes-dev libxi-dev libxrender-dev \
+            libxcb1-dev libxcb-glx0-dev libxcb-keysyms1-dev libxcb-image0-dev \
+            libxcb-shm0-dev libxcb-icccm4-dev libxcb-sync-dev libxcb-xfixes0-dev \
+            libxcb-shape0-dev libxcb-randr0-dev libxcb-render-util0-dev libxcb-util-dev \
+            libxcb-xinerama0-dev libxcb-xkb-dev libxcb-cursor-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libsm-dev libice-dev \
+            libssl-dev zlib1g-dev libdbus-1-dev
+          # ⚠️ 上面这一长串里只要有**一个**名字不存在，apt 就整条失败、一个都装不上
+          #   （写这版时就踩过：libxcb-xkb0-dev 是不存在的包，正确名是 libxcb-xkb-dev）。
+          #   名字已在 24.04 上用 apt-cache 逐个核过，22.04 同名。别凭印象改。
+
+      - name: Static Qt
+        id: qt
+        # 两种架构都是**原生** runner（arm64 job 跑在 ubuntu-24.04-arm 上），不涉及交叉编译。
+        # ★ 这里用的是 QT_VERSION_LINUX（6.8.3），不是上面那个 6.11 —— 两个 linux 预编产物
+        #   已经按 6.8.3 发布好了，跟着 Windows/macOS 一起抬版本等于把它们作废、白编两轮。
+        uses: ./.github/actions/qt-static
+        with:
+          qt-version: ${{ env.QT_VERSION_LINUX }}
+          target: linux-${{ matrix.arch }}
+
+      - name: Configure
+        shell: bash
+        run: |
+          cmake -S clashauto-c++ -B "$BUILD_DIR" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="${{ steps.qt.outputs.qt-root }}" \
+            -DAPP_VERSION="$APP_VERSION"
+
+      - name: Build
+        shell: bash
+        run: cmake --build "$BUILD_DIR" --parallel
+
+      - name: Pure-logic self-tests (static deps / ARP parse / per-NIC egress / TIDE nodes / bundled-core seeding / rules / proxy cfg / crypto KAT)
+        shell: bash
+        # 全都不碰网络、不需要 root、毫秒级，所以两种架构都跑。
+        # · ARP 表解析：**三个平台的 arp 输出形态全覆盖** —— 解析器按运行期参数分派而不是 #ifdef，
+        #   所以 Windows 那种分段格式在这条 Linux 流水线上一样被测到（以前它连编都不编）。
+        #   解析错的表现是「每张网卡的网关 MAC 都为空 → 所有设备都代理不了」，且没有任何报错
+        #   指向那里。
+        # · 每网卡出口：造临时台账真跑一遍 ensureFullConfig 并对产物断言。这段生成一旦写坏，
+        #   核心是**整份配置拒绝加载**（代理全起不来），而 YAML 是手搓字符串、编译期查不出来。
+        # · TIDE 节点生成：重点是那个 1622 字符的后量子公钥必须逐字节穿过字符串拼接——
+        #   被截断或折行，核心就拒绝整份配置。
+        # · 集成内核落位：**唯一**能挡住「全新安装打不开」的守卫。
+        #   2026-08-07 正式发布包 1.0.965 在树莓派上实测：全新安装启动后既没有 command/、
+        #   也没有 full.yaml、更没有核心进程——落位只写在 startCore() 里，而通往它的每条路
+        #   都先用 isCoreInstalled() 挡一道，于是落位被它自己需要的那道门挡在外面。
+        #   CI 当时是绿的，因为它只验「core 在不在包里」；开发机也永远碰不到，
+        #   因为 userDir/command/core 早就下载过了。只有全新安装会撞上，
+        #   而全新安装恰恰是每个新用户的第一次体验。
+        run: |
+          set -euo pipefail
+          bin="$BUILD_DIR/coast"
+          export QT_QPA_PLATFORM=offscreen
+          # ★★ 每条都套 `timeout`，这不是保险起见，是**本仓库反复踩的那个坑的唯一门禁**：
+          #   自测钩子一旦没被注册（比如被裹进某个平台专属的 #ifdef），设了 env 的效果不是
+          #   "测试失败"，而是**把整个 GUI 正常启动、进程永不退出** —— 在 CI 里就表现为这一步
+          #   一直挂到 job 超时（默认 6 小时），日志里什么都没有。2026-08-08 在 Linux 上实测过
+          #   一次：进程跑满 316 秒仍在 do_poll。套上 timeout 之后，同样的 bug 变成 30 秒内
+          #   一条写明"疑似钩子没注册"的红灯。
+          #   （反过来说：这些自测本身都是毫秒级的，30 秒到不了就一定是出事了，不是慢。）
+          run_selftest() {
+            local name="$1"
+            local out rc
+            set +e
+            out="$(timeout 30 env "$name=1" "$bin" 2>&1)"; rc=$?
+            set -e
+            if [ "$rc" = 0 ]; then
+              echo "PASS  $name"
+              return 0
+            fi
+            printf '%s\n' "$out" | sed 's/^/      /'
+            if [ "$rc" = 124 ]; then
+              echo "::error::$name 30 秒未退出 —— 多半是这个钩子没在 main_qml.cpp 里注册"
+              echo "::error::（或被裹进了某个平台专属的 #ifdef），于是设了 env 只是把 GUI 启动起来"
+            else
+              echo "::error::$name 失败（exit=$rc）"
+            fi
+            return 1
+          }
+          # ★ 静态化引入的门禁，也是**这条流水线唯一**能证明"插件真被链进来了"的地方：
+          #   TLS 后端 / QSQLITE / 图片格式 / QML 模块漏了都不报编译或链接错误。
+          #   顺带说明为什么 CMakeLists 里不敢用 qt_import_plugins 去筛平台插件：
+          #   上面那行 QT_QPA_PLATFORM=offscreen 依赖 qoffscreen，一筛就全灭。
+          run_selftest COAST_STATICDEPS_SELFTEST
+          run_selftest COAST_ARPPARSE_SELFTEST
+          run_selftest COAST_NICEGRESS_SELFTEST
+          run_selftest COAST_TIDE_SELFTEST
+          run_selftest COAST_BUNDLEDCORE_SELFTEST
+          # ↓ 这三条以前在 Linux 上**根本跑不了**：它们被误裹在 #ifdef COAST_HAVE_RUST_STACK
+          #   里，而那个宏只在 Windows+COAST_RUST 时定义。分流判定（RuleEngine）是三端共用的
+          #   唯一实现，加密 KAT 也一样，却只有 Windows 那条腿能验 —— 现在补上。
+          #   COAST_CRYPTO_SELFTEST 另需 COAST_HAVE_OPENSSL；Linux 装了 libssl-dev，恒为真。
+          #   万一哪天不真了，上面的 timeout 会把它变成一条 30 秒的明确红灯而不是挂死。
+          run_selftest COAST_RULE_SELFTEST
+          run_selftest COAST_PROXYCFG_SELFTEST
+          run_selftest COAST_CRYPTO_SELFTEST
+          # ↓ 控制端点这一整条链路（ControlApi 意图总线 → ControlServer 传输 → --mcp）。
+          #   这块的产物全是 JSON，**结构写坏了编译期一点都发现不了**，而消费者在另一个进程里
+          #   （模型只会说"工具返回了看不懂的东西"），从那儿倒查回来的代价极高。
+          #   ★ CONTROLSERVER 那条**不能**在设了 COAST_CONTROL_ALLOW_POLICY 的环境里跑：
+          #     那个逃生门会把策略级直接放行，于是"门禁挡住了没有"的断言永远通不过。
+          #     自检自己会检测并跳过，但 CI 这边本就不该设它。
+          run_selftest COAST_CONTROLAPI_SELFTEST
+          run_selftest COAST_CONTROLSERVER_SELFTEST
+          run_selftest COAST_MCP_SELFTEST
+          run_selftest COAST_CONFIRM_SELFTEST
+          run_selftest COAST_RULEEXPLAIN_SELFTEST
+          run_selftest COAST_CHANGELOG_SELFTEST
+          run_selftest COAST_NODEHEALTH_SELFTEST
+          run_selftest COAST_SCHEDULE_SELFTEST
+          # ↓ core -t 复核。runner 上没有内核，所以这里验到的是 **fail-open 那条路**：
+          #   判不了时必须 ran=false 且给得出原因，而不是悄悄 ok=true（那样用户会以为
+          #   有核心把关，其实一次都没跑过）。"坏配置能被判出来"那半边要有内核才验得了，
+          #   已在有内核的机器上验过，见 ConfigValidator::runSelfTest 的说明。
+          run_selftest COAST_CONFIGVALIDATE_SELFTEST
+          # 没加进来的三个，各有原因，别顺手补上：
+          #   · COAST_TUNSERVICE_SELFTEST —— 会**真的接管默认路由**，要 root 且只能在可牺牲
+          #     网络的机器上跑；在 runner 上跑等于把这个 job 的网络掀了。
+          #   · COAST_SELFROUTE_SELFTEST  —— 同类，动的是策略路由。
+          #   · COAST_OUTBOUND_PROBE      —— 要 full.yaml + 节点名才有意义，不带参数时打用法
+          #     退出 2，当断言用只会是一条恒红。
+
+      - name: Stage portable app
+        shell: bash
+        run: |
+          set -euo pipefail
+          stage="$STAGE_DIR"
+          app_dir="$stage"
+          rm -rf "$stage"
+          mkdir -p "$app_dir"
+
+          cp "$BUILD_DIR/coast" "$app_dir/"
+          chmod +x "$app_dir/coast"
+
+          # ★ 静态 Qt 之后这一步只剩一次 cp。原先这里有一整套「自带 Qt 运行时」的编排，
+          #   全部消失了：拷 lib/libQt6*.so* 与 libicu*、整目录拷 plugins/ 与 qml/、
+          #   写 qt.conf 指路、patchelf 给主程序塞 $ORIGIN/lib 的 RPATH，以及四条
+          #   「某个插件在不在」的校验。现在这些都在二进制里。
+          ls -l "$app_dir/coast"
+
+          # ★ 断言「Qt 真的不在依赖里了」。ldd 看的是**实际会被加载的东西**，比数文件可靠。
+          #   任何 libQt6* 出现在这里就说明静态化没生效 —— 而那种包在 CI 上照样跑得好好的
+          #   （构建机上有 Qt），只有用户机器才炸。
+          echo "—— coast 的动态依赖 ——"
+          ldd "$app_dir/coast" | sort
+          if ldd "$app_dir/coast" | grep -q 'libQt6'; then
+            echo "::error::静态化没生效 —— coast 仍动态依赖 Qt"
+            exit 1
+          fi
+          # libstdc++/libgcc_s 也应当已被 -static-libstdc++ -static-libgcc 收进去。
+          # 这条只警告不阻断：它坏的方式是"用户机上 GCC 运行时版本太老才起不来"，
+          # 比缺 Qt 温和得多，不值得为它挡住发布。
+          if ldd "$app_dir/coast" | grep -qE 'libstdc\+\+|libgcc_s'; then
+            echo "::warning::coast 仍动态依赖 libstdc++/libgcc_s（应由 -static-libstdc++ -static-libgcc 收入）"
+          fi
+
+      - name: Bundle latest stable core
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CORE_PREFIXES: ${{ matrix.core_prefixes }}
+        run: |
+          set -euo pipefail
+          # 打包默认集成最新**正式版**内核到包根 core（.deb 落 /opt/coast/core）；首次运行由
+          # CoreController::seedBundledCore() 落位到 ~/.local/share/Coast/command/core（缺了
+          # 才补，绝不覆盖）。挑选规则与应用内 CoreRelease.h 一字不差：/releases 全量列表
+          # （latest 会落到 fork 从上游继承的零资产空 tag 上）、跳过 draft/prerelease。
+          # 下载失败**打包当场失败**——默认集成的包缺内核是静默劣化。
+          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
+            'https://api.github.com/repos/ClashrAuto/clash/releases?per_page=20' -o /tmp/core-releases.json
+          url="$(python3 - /tmp/core-releases.json <<'PY'
+          import json, os, sys
+          releases = json.load(open(sys.argv[1]))
+          for release in releases:
+              if release.get("draft") or release.get("prerelease"):
+                  continue
+              for prefix in os.environ["CORE_PREFIXES"].split(","):
+                  for asset in release.get("assets", []):
+                      name = asset.get("name", "")
+                      if name.startswith(prefix) and name.endswith(".gz"):
+                          print(asset["browser_download_url"])
+                          sys.exit(0)
+          sys.exit(1)
+          PY
+          )" || { echo "正式版通道里没有 $CORE_PREFIXES 产物" >&2; exit 1; }
+          echo "集成内核: $(basename "$url")"
+          # 下载直链不带 Authorization：它 302 到对象存储，多带一层凭据可能被拒
+          curl -fsSL --retry 3 "$url" | gunzip > "$STAGE_DIR/core"
+          test -s "$STAGE_DIR/core"
+          chmod 755 "$STAGE_DIR/core"
+          # ★ 真的把集成内核跑一下，并把它自报的版本打进日志。
+          #
+          # 原先只验「文件非空」，从头到尾没执行过它。于是一个下载损坏、架构不对、
+          # 或者上游换了产物命名的内核会一路进到发布包里——而 CI 全绿。
+          # 用户装上之后的表现是「什么都连不上」，且日志里只有一句「启动失败」。
+          # 两条 Linux 流水线都是原生 runner（arm64 job 跑在 ubuntu-24.04-arm 上），
+          # 所以两种架构都能真跑。
+          #
+          # 打印版本还有第二个用处：**取内核这一步和 clash 的发布是有竞态的**。
+          # 2026-08-07 就撞上了——Coast 1.0.969 取到 v1.10.4413，而修复的后一半
+          # 在几分钟后才作为 v1.10.4414 发布，于是发布包里的内核只带了一半修复。
+          # 版本号进了日志，这种事至少能在事后一眼看出来。
+          echo "集成内核自报版本: $("$STAGE_DIR/core" -v | head -1)"
+
+      - name: Create portable tar.gz
+        shell: bash
+        run: |
+          mkdir -p dist
+          tar -C dist/package -czf "dist/Coast-${APP_VERSION}-linux-${{ matrix.arch }}-portable.tar.gz" Coast
+          (cd dist/package && zip -r "../Coast-${APP_VERSION}-linux-${{ matrix.arch }}-portable.zip" Coast)
+
+      - name: Create deb package
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg_root="dist/deb/Coast"
+          install_root="$pkg_root/opt/coast"
+          mkdir -p "$install_root" "$pkg_root/usr/share/applications" "$pkg_root/usr/bin" "$pkg_root/DEBIAN"
+
+          # 扁平安装：暂存目录根即 coast + Qt 运行时（无 clashauto-c++ 子目录），整体落到 /opt/coast/
+          cp -a "$STAGE_DIR/." "$install_root/"
+          ln -s /opt/coast/coast "$pkg_root/usr/bin/coast"
+
+          cat > "$pkg_root/usr/share/applications/coast.desktop" <<'EOF'
+          [Desktop Entry]
+          Type=Application
+          Name=Coast
+          Exec=/opt/coast/coast
+          Terminal=false
+          Categories=Network;
+          EOF
+
+          installed_size="$(du -sk "$install_root" | cut -f1)"
+          # ★ Depends 的正确来源是**二进制的 NEEDED 表**，不是「装上能跑」：开发机/CI/验证容器上
+          #   这些库多半已被别的东西装进来了，漏写一项照样一路绿灯，只有干净的用户机器会炸
+          #   （当年漏过 libopengl0，后来又漏过 libx11-xcb1 / libsm6 / libice6 / libzstd1，
+          #   每一个都足以让程序起不来）。
+          #   静态 Qt 把这张表整个换了一遍 —— Qt 自己不再占位，但它引用的 xcb/GL/fontconfig
+          #   从"Qt 的 .so 自己带着"变成了**主程序的直接依赖**。正好借这次把原先写在注释里、
+          #   要人手动照着跑的核对流程，变成 CI 里真跑的一步。
+          #
+          # ⚠️ 有一项**永远查不出来**，必须手写死：libssl3。TLS 后端编的是 -openssl-runtime，
+          #    运行期 dlopen libssl.so.3，而 dlopen 的库不进 NEEDED 表。少了它订阅和更新全废，
+          #    任何基于 NEEDED 的自动核对都不会提醒你。
+          DEB_DEPENDS="libc6, libgl1, libglx0, libopengl0, libegl1, libdbus-1-3, libfontconfig1, libfreetype6, libbrotli1, zlib1g, libzstd1, libssl3 | libssl3t64, libx11-6, libx11-xcb1, libsm6, libice6, libxcb1, libxcb-cursor0, libxcb-icccm4, libxcb-image0, libxcb-keysyms1, libxcb-randr0, libxcb-render0, libxcb-render-util0, libxcb-shape0, libxcb-shm0, libxcb-sync1, libxcb-xfixes0, libxcb-xkb1, libxcb-glx0, libxcb-util1, libxkbcommon0, libxkbcommon-x11-0"
+          # libbrotli1 是**静态 Qt 带来的新直接依赖**：静态链系统 freetype 之后，freetype
+          # 自己那份 libbrotlidec.so.1 被提到了主程序的 NEEDED 表上（objdump 实测确有一条）。
+          # 靠 libfreetype6 间接带入是能work，但「反正有别的包会带」正是本仓库当年漏掉
+          # libopengl0 的那个假设 —— 直接依赖就直接写。
+          # 相对静态化之前去掉了三项，每一项都有明确理由（不是"看着没用就删"）：
+          #   libstdc++6 / libgcc-s1 → 已被 -static-libstdc++ -static-libgcc 收进二进制
+          #   libglib2.0-0           → 静态 Qt 用 -no-glib 编，这条依赖不复存在
+          # 删错了不会没人知道：下面的反查会把它列进 uncovered。
+          # ★★ 整段套 `set +e` / `|| true`：这是一条**诊断**，它本身绝不该有能力挡住打包。
+          #   第一版没做到，当场把 Linux 两条腿都弄红了（1.0.9xx，Create deb package 退出 1，
+          #   而 Qt/编译/自测/装包全是绿的）。根因很典型：NEEDED 表的第一项是动态链接器
+          #   ld-linux-<arch>.so.*，它在 ldd 输出里**没有 `=>` 路径**，于是 path 为空、
+          #   `dpkg -S ""` 退出 1；而这一步开着 `set -euo pipefail`，pipefail 把管道的失败
+          #   传出来、set -e 就地中止 —— 整个 .deb 都没生成。
+          #   （同类的还有 linux-vdso.so.1，内核提供，根本不属于任何包。）
+          echo "—— NEEDED → 包名 反查 ——"
+          uncovered=""
+          set +e
+          for so in $(objdump -p "$install_root/coast" 2>/dev/null | awk '/NEEDED/{print $2}' | sort -u); do
+            path="$(ldd "$install_root/coast" 2>/dev/null | awk -v s="$so" '$1==s{print $3}')"
+            if [ -z "$path" ]; then
+              # 动态链接器 / vdso：没有实体路径可查，也无需声明（libc6 已经带着它）。
+              printf '  %-26s %-42s %s\n' "$so" "(无路径)" "(链接器/vdso，跳过)"
+              continue
+            fi
+            # ★ 必须 readlink -f 之后再查。merged-/usr 的系统上 ldd 给的是 /lib/... 而
+            #   dpkg 数据库里记的是 /usr/lib/...（且带完整版本号后缀），直接拿 ldd 的路径查
+            #   **每一条都查不到** —— 那样这段反查会安安静静地把所有包都报成 "?"、uncovered
+            #   永远为空，看起来一切正常，实际什么都没验。第一版就是这样，白跑一轮。
+            real="$(readlink -f "$path" 2>/dev/null)"
+            pkg="$(dpkg -S "${real:-$path}" 2>/dev/null | head -1 | cut -d: -f1)"
+            printf '  %-26s %-42s %s\n' "$so" "$path" "${pkg:-?}"
+            base="${pkg%t64}"   # t64 过渡期同一个库有两个包名，去后缀再比，免得误报
+            if [ -n "$pkg" ]; then
+              case "$DEB_DEPENDS" in *"$base"*) ;; *) uncovered="$uncovered $pkg";; esac
+            fi
+          done
+          set -e
+          # 只告警不阻断：dpkg -S 在 t64/多架构布局下偶有认不出的情况，为此挡住整条发布线
+          # 不划算。但结果必须**出现在日志里** —— 只在注释里写"请手动核对"等于没查。
+          [ -z "$uncovered" ] || echo "::warning::这些 NEEDED 的包没写进 Depends:$uncovered"
+
+          cat > "$pkg_root/DEBIAN/control" <<EOF
+          Package: coast
+          Version: ${APP_VERSION}
+          Section: net
+          Priority: optional
+          Architecture: ${{ matrix.deb_arch }}
+          Installed-Size: ${installed_size}
+          Maintainer: Coast <auto@clash.com>
+          Depends: ${DEB_DEPENDS}
+          Description: Coast Qt desktop client
+           Coast desktop client built with Qt Quick (QML).
+          EOF
+
+          fakeroot dpkg-deb --build "$pkg_root" "dist/Coast-${APP_VERSION}-linux-${{ matrix.arch }}.deb"
+
+      - name: Generate SHA256 sidecars
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 每个发布物生成 <文件>.sha256（仅摘要），供应用更新时直连 GitHub 校验完整性
+          for f in dist/Coast-*; do
+            case "$f" in *.sha256) continue;; esac
+            [ -f "$f" ] || continue
+            sha256sum "$f" | awk '{print $1}' > "$f.sha256"
+          done
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coast-linux-${{ matrix.arch }}
+          path: |
+            dist/Coast-*-linux-${{ matrix.arch }}-portable.tar.gz
+            dist/Coast-*-linux-${{ matrix.arch }}-portable.zip
+            dist/Coast-*-linux-${{ matrix.arch }}.deb
+
+      - name: Write release notes
+        if: github.event_name == 'push'
+        shell: bash
+        env:
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: printf '%s\n' "$COMMIT_MSG" > release-notes.md
+
+      - name: Upload to GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          # 名字带上分支，便于在 Release 列表里一眼分辨这是哪条分支的测试版。
+          # ★ 资源文件名 Coast-<ver>-<平台>-<架构>-…（旧名 ClashAuto-*，2026-08 统一改成品牌名）。
+          #   改前缀是安全的：app 的一键更新按文件名里的**平台/架构**挑资源，不认前缀
+          #   （UpdateController::recommendedIndex / UpdateChecker.macAsset），老版本照样能更新。
+          name: ${{ env.IS_PRERELEASE == 'true' && format('Coast {0} (beta · {1})', env.APP_VERSION, env.SOURCE_REF) || format('Coast {0}', env.APP_VERSION) }}
+          prerelease: ${{ env.IS_PRERELEASE == 'true' }}
+          target_commitish: ${{ github.sha }}
+          # 更新说明 = 触发本次构建的提交说明（app 内更新弹窗直接展示），经上一步写盘的
+          # 文件传入。不能用 generate_release_notes：创建 release 时 GitHub 会把「提供的
+          # body + 自动说明」合并，body 里的部分换行被转义成字面 \n；后续 job 的 body_path
+          # 更新又会覆盖掉自动说明——它只留下污染的中间态，纯负作用，故移除。
+          body_path: release-notes.md
+          # prerelease 绝不能占 latest：/releases/latest 是正式版通道，被 beta 占了会把所有
+          # 没开「接收测试版」的用户推到测试版上去。
+          make_latest: ${{ env.IS_PRERELEASE == 'true' && 'false' || 'true' }}
+          overwrite_files: true
+          files: |
+            dist/Coast-*-linux-*
+
+  # ———————————————————————————————————————————————————————————————————————
+  # version.json：客户端查更新的唯一数据源，用来绕开 GitHub API 的限流。
+  #
+  # 客户端原本每次查更新要打三个 api.github.com 端点（程序 release、内核 release、GeoIP）。
+  # 未登录的 API 是 **60 次/小时，按出口 IP 算** —— 同一个机场出口后面挂着几百个用户时谁都
+  # 查不动，而 GitHub 返回的限流报错读起来像网络故障，用户只会觉得「更新坏了」。
+  #
+  # 这里把版本信息汇总成一个 JSON，作为**固定 tag `version` 的 release 资源**发布。
+  # 客户端只下 `…/releases/download/version/version.json` —— 走资源 CDN，不是 API，无限流。
+  #
+  # ★ **needs 只挂 windows + linux，不挂 macos**：mac 的两个 DMG 由外部签名仓库异步追加，
+  #   等它等不到。清单是**逐个包合并**的（脚本里 packages_from_release），mac 那两条会沿用
+  #   上一版的条目、各带各的版本号；等 schat.build 传完 DMG 之后，由**它**回头
+  #   workflow_dispatch 一次 manifest-refresh.yml 把那两条补上（不再是定时轮询，
+  #   理由见那个文件顶部）。
+  manifest:
+    name: Update version.json manifest
+    needs: [windows, linux]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    # 同一分支上连着推两次时，两个 run 会同时「读旧清单 → 改 → 传」，后写的那个会把先写的
+    # 盖掉（读改写没有原子性）。串行化，且**不取消**排队中的那个 —— 取消等于丢一次更新。
+    concurrency:
+      group: version-manifest
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+          # ★ 必须 0：版本号是 `major.minor.<提交数>`，而默认的浅克隆只有 1 个提交，
+          #   `git rev-list --count HEAD` 会返回 1 —— 本 job 第一次上线就是这么算出
+          #   `v1.0.1-beta.…` 去查一个不存在的 tag、404 崩掉的。其余 job 也都是 0。
+          fetch-depth: 0
+
+      - name: Resolve release tag
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 版本口径必须与 windows/linux/trigger-mac 完全一致。同一段 sed + 提交数。
+          base="$(sed -nE 's/.*project[[:space:]]*\([[:space:]]*[^ ]+[[:space:]]+VERSION[[:space:]]+([0-9]+(\.[0-9]+){1,3}).*/\1/p' clashauto-c++/CMakeLists.txt | head -n 1)"
+          [ -n "$base" ] || { echo "::error::CMakeLists 里找不到 project VERSION"; exit 1; }
+          major="$(echo "$base" | cut -d. -f1)"
+          minor="$(echo "$base" | cut -d. -f2)"; [ -n "$minor" ] || minor=0
+          version="${major}.${minor}.$(git rev-list --count HEAD)"
+          if [ "$GITHUB_REF" = "refs/heads/master" ] || [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "tag=v${version}" >> "$GITHUB_OUTPUT"
+            echo "channel=release" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=v${version}-beta.${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+            echo "channel=prerelease" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Self-test manifest merge
+        # 不联网的合并自测。**必须在生成之前跑**：合并那条路在真机上不容易被撞到
+        # （等一会儿 mac/windows 的包就补齐了），只靠肉眼看产物是测不出来的。
+        run: python3 .github/scripts/build_version_manifest.py --selftest
+
+      - name: Fetch previous manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 首次发布时这个 release 还不存在（404）——那就当首份生成，不是错误。
+          if curl -fsSL --max-time 60 -o prev.json                "https://github.com/${GITHUB_REPOSITORY}/releases/download/version/version.json"; then
+            echo "已取到旧清单（$(wc -c < prev.json) 字节）"
+          else
+            echo "没有旧清单，按首份生成"
+            : > prev.json
+          fi
+
+      - name: Build version.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/build_version_manifest.py             --tag "${{ steps.ver.outputs.tag }}"             --channel "${{ steps.ver.outputs.channel }}"             --prev prev.json -o version.json
+
+      - name: Publish manifest
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: version
+          name: version manifest
+          # ★ 绝不能占 latest，也绝不能标成 prerelease：它不是一个版本，只是一份数据。
+          #   占了 latest 会让 /releases/latest 指到这里，所有还在走老路径的客户端立刻瞎掉。
+          make_latest: false
+          prerelease: false
+          body: |
+            客户端查更新用的版本清单（由 CI 自动维护，不是一个可安装的版本）。
+
+            直链：https://github.com/${{ github.repository }}/releases/download/version/version.json
+          overwrite_files: true
+          files: version.json
+
+  # 透明网关 headless 自测：下载打好的 linux-x64 包（自带 Qt，offscreen 可独立跑），用 TAP 把真实
+  # 内核 TCP 当被劫持设备，经 NetStack 拨内置假 SOCKS，验证「用户态栈转发 + 每设备身份」——不需真机/真实 ARP。
+  # 独立 job：不阻塞 release（release 已由 linux/windows job 发布），失败只作可见告警。
+  # ★ 这个 job 曾经跑「TAP + 用户态栈」的数据面自测。lwIP 移除后 Linux 只有 TPROXY（内核转发），
+  #   没有用户态栈可测，那部分已迁到 windows job 的 "coaststack gateway self-test"。
+  #   这里保留的是 **NDP RA 解析自测** —— 与数据面无关、却守着「双栈设备 v6 漏代理」这条
+  #   静默故障线。详见 validate/gateway_selftest.sh 的头注释。
+  gateway-selftest:
+    name: NDP RA parse self-test (Linux)
+    needs: [linux]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+      - name: Download linux x64 artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: Coast-linux-x64
+          path: dl
+      - name: Install runtime deps
+        shell: bash
+        # ★ 依赖从**下载下来的 .deb 自己**装，不再手抄一份包名清单。
+        #
+        #   原来这里写死六个包（libopengl0 libegl1 libglib2.0-0 libfontconfig1 libdbus-1-3
+        #   libfreetype6）。Qt 改静态链接之后这份清单当场不够用了：xcb 平台插件被**链进了
+        #   可执行文件**，于是它的共享库依赖从「插件懒加载时才需要」变成主二进制的 ELF
+        #   NEEDED —— 进程一启动就要，哪怕跑的是 offscreen 后端。裸 runner 上 coast 因此
+        #   根本起不来，这个 job 从此常红；而 .deb 的 Depends 早已补全（21 个 xcb/xkb 相关），
+        #   两份清单就这么漂移了。
+        #
+        #   让 apt 按 .deb 声明的 Depends 去解析，漂移在结构上不可能再发生。顺带这一步
+        #   还成了「Depends 声明够不够」的门禁 —— 那恰恰是本仓库反复漏过的东西：漏
+        #   libopengl0 一次，漏 libx11-xcb1 / libsm6 / libice6 / libzstd1 又一次。
+        #   下面的自测仍然跑 **portable 包里那份**二进制：万一 Depends 仍有遗漏，
+        #   apt 装得上（它只认声明）而二进制起不来，照样会被这一步之后的自测抓住。
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y ./dl/Coast-*-linux-x64.deb
+      - name: Run headless self-test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app
+          tar -C app -xzf dl/Coast-*-linux-x64-portable.tar.gz
+          BIN="$(find app -type f -name coast | head -1)"
+          test -n "$BIN" || { echo "找不到 coast 二进制"; exit 1; }
+          chmod +x "$BIN"
+          bash validate/gateway_selftest.sh "$BIN"
+
+  # macOS **两条产品线的正式包都不在本 CI 打**（本仓库没有、也不该有 Developer ID 私钥）
+  # ——由外部构建仓库的「专用分支」承载（该分支已配签名+公证 secret，workflow 用 on:push
+  # 监听本分支）。本 job 用 PAT 往那个分支推一个空提交，参数写在提交说明里；对方 checkout
+  # clashauto 的**同一个 sha** 从头构建、签名、公证，再发到本次 release 的 tag 上：
+  #   product: coast-swift → clashauto-mac.yml    → Coast-<ver>-macos-universal.dmg
+  #   product: coast-qt    → clashauto-mac-qt.yml → Coast-<ver>-macos-universal-qt.dmg
+  # 打包内容完全不在外部仓库的默认分支上。
+  # 目标仓库地址/令牌/分支都放本仓库 Secrets，不在代码里明文暴露：
+  #   SCHAT_BUILD_REPO   —— 目标仓库 owner/repo
+  #   SCHAT_BUILD_TOKEN  —— 对该仓库有 contents:write 的 PAT
+  #   SCHAT_BUILD_BRANCH —— 专用打包分支名（可选，缺省 clashauto-mac）
+  # 必需 secret（REPO/TOKEN）未配置时本 job 自动跳过（不失败）。
+  trigger-mac:
+    name: Trigger signed macOS builds (Swift + Qt)
+    # 只依赖 windows（release 由它创建，mac DMG 随后追加）；mac 签名与 linux 无关，
+    # 不因 linux 失败被 skip。也**不 needs 两个 mac 构建 job** —— schat.build 会自己
+    # checkout 同一个 sha 从头构建，本仓库的构建结果不是它的输入；挂上依赖只会让
+    # 「Swift 编译挂了 → Qt 包也发不出来」这种无关耦合成立。
+    needs: [windows]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+          fetch-depth: 0
+
+      # 版本口径必须与 windows/linux/macos 各 job 完全一致，否则 schat.build 会把签名包
+      # 发到一个不存在（或不对）的 tag 上。同一段 sed + 提交数，一个字都不能改。
+      - name: Resolve build version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="$(sed -nE 's/.*project[[:space:]]*\([[:space:]]*[^ ]+[[:space:]]+VERSION[[:space:]]+([0-9]+(\.[0-9]+){1,3}).*/\1/p' clashauto-c++/CMakeLists.txt | head -n 1)"
+          [ -n "$base" ] || { echo "Cannot find project VERSION in clashauto-c++/CMakeLists.txt" >&2; exit 1; }
+          major="$(echo "$base" | cut -d. -f1)"
+          minor="$(echo "$base" | cut -d. -f2)"; [ -n "$minor" ] || minor=0
+          version="${major}.${minor}.$(git rev-list --count HEAD)"
+          if [ "$GITHUB_REF" = "refs/heads/master" ] || [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            is_pre=false; tag="v${version}"
+          else
+            is_pre=true; tag="v${version}-beta.${GITHUB_SHA:0:7}"
+          fi
+          { echo "version=$version"; echo "tag=$tag"; echo "prerelease=$is_pre"; } >> "$GITHUB_OUTPUT"
+          echo "目标 release: $tag (prerelease=$is_pre)"
+
+      # ★ 两条 mac 产品线**共用这一次触发**，而不是各推各的。
+      #   它们是同一个分支上的 on:push，两个 job 并发 push 必然有一个非快进被拒 ——
+      #   那种失败还很隐蔽（另一条线静默地没被签）。一次提交带两个 product 标记，
+      #   对面两个 workflow 各按自己的 `contains(... 'product: coast-xxx')` 认领。
+      - name: Trigger schat.build (empty commit carrying the release tag)
+        env:
+          SCHAT_TOKEN: ${{ secrets.SCHAT_BUILD_TOKEN }}
+          SCHAT_REPO: ${{ secrets.SCHAT_BUILD_REPO }}
+          SCHAT_BRANCH: ${{ secrets.SCHAT_BUILD_BRANCH }}
+          TARGET_TAG: ${{ steps.ver.outputs.tag }}
+          TARGET_PRERELEASE: ${{ steps.ver.outputs.prerelease }}
+          TARGET_VERSION: ${{ steps.ver.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${SCHAT_TOKEN:-}" ] || [ -z "${SCHAT_REPO:-}" ]; then
+            echo "::warning::SCHAT_BUILD_TOKEN/REPO 未配置，跳过 macOS 签名构建触发"
+            exit 0
+          fi
+          branch="${SCHAT_BRANCH:-clashauto-mac}"
+          tmp="$(mktemp -d)"
+          origin="https://x-access-token:${SCHAT_TOKEN}@github.com/${SCHAT_REPO}.git"
+          mask() { sed 's#x-access-token:[^@]*@#x-access-token:***@#g'; }
+          git clone --depth 1 --branch "$branch" "$origin" "$tmp/repo" 2>&1 | mask
+          cd "$tmp/repo"
+          git config user.name "clashauto-ci"
+          git config user.email "ci@clashauto.local"
+          # 参数走**提交说明**而不是文件：对方分支上除了 workflow 没有别的内容，
+          # 改文件会污染它的历史；而 commit message 在 on:push 里用
+          # `github.event.head_commit.message` 就能原样读到。
+          make_trigger_commit() {
+            git commit --allow-empty -m "trigger: clashauto macOS (swift + qt)" \
+              -m "source-repo: ${GITHUB_REPOSITORY}" \
+              -m "source-sha: ${GITHUB_SHA}" \
+              -m "source-ref: ${GITHUB_REF_NAME}" \
+              -m "product: coast-swift" \
+              -m "product: coast-qt" \
+              -m "release-tag: ${TARGET_TAG}" \
+              -m "prerelease: ${TARGET_PRERELEASE}" \
+              -m "version: ${TARGET_VERSION}"
+          }
+          make_trigger_commit
+          # ★ 这一步会与**另一轮 CI** 撞车，所以必须能重试。
+          #
+          #   两轮 clashauto 的 CI 同时在跑（例如刚推了工作分支、又把它合进 master）时，两个
+          #   trigger 作业会在几秒内推同一个 `clashauto-mac` 分支，后到的那个必然被拒
+          #   （non-fast-forward）。代价不对称得吓人：**输的那一轮就此没有任何 macOS 包**，
+          #   而它可能正是那个 make_latest 的正式版 —— 用户在更新里看到新版本却下不到 mac 包。
+          #   2026-08-10 实测栽过一次：v1.0.1089 只有 Windows/Linux 产物。
+          #
+          # ★★ 重试用 fetch + reset + **重建提交**，绝不能用 `git rebase`：这个触发提交是
+          #    **空提交**（参数全在 commit message 里），而 rebase 默认会把空提交丢掉。
+          #    那样推送会「成功」，分支上却什么都没多 —— 签名构建根本不会被触发，而 CI 全绿。
+          #    比直接失败糟得多。
+          for attempt in 1 2 3 4 5; do
+            if git push "$origin" "HEAD:${branch}" 2>&1 | mask; then
+              break
+            fi
+            if [ "$attempt" = 5 ]; then
+              echo "::error::推 ${branch} 连续 5 次被拒，本次 release 不会有 macOS 包"
+              exit 1
+            fi
+            echo "::warning::推送被拒（多半是另一轮 CI 同时在推），第 ${attempt} 次重试"
+            # 随机退避：两轮同时重试的话，固定间隔会让它们一直保持同步、一起撞下去。
+            sleep $(( (RANDOM % 5) + attempt * 3 ))
+            git fetch "$origin" "$branch" 2>&1 | mask
+            git reset --hard FETCH_HEAD 2>&1 | mask
+            make_trigger_commit
+          done
+          echo "已触发签名构建 → ${SCHAT_REPO}@${branch}"
+          echo "  源: clashauto@${GITHUB_SHA} (${GITHUB_REF_NAME})"
+          echo "  目标 release: ${TARGET_TAG} (prerelease=${TARGET_PRERELEASE})"
+          echo "  产品线: coast-swift（…-macos-universal.dmg）+ coast-qt（…-macos-universal-qt.dmg）"
+
+  # ————————————————————————————————————————————————————————————————
+  # Swift 版 macOS 客户端（macos/）。**完全独立于上面的 Qt 流水线**：不共用 env、
+  # 不 needs 任何 job。本 job 只出未签名 artifact，签名+公证+上传 Release 由外部仓库
+  # integemjack/schat.build 做（本仓库 CI 拿不到 Developer ID 私钥，也不该拿到）。
+  #
+  # 与上面的 Qt `macos` job 是**并存的两条产品线**，靠资源名里的 -qt 区分：
+  #   本 job → Coast-<ver>-macos-universal.dmg      （macOS 26+，Liquid Glass）
+  #   Qt job → Coast-<ver>-macos-universal-qt.dmg   （macOS 13+，Intel + Apple Silicon）
+  # 两边的一键更新各认各的（UpdateChecker.isQtLine / UpdateController::recommendedIndex），
+  # 早先「两个同名 macOS 包落在同一 release、老版本挑到哪个纯看运气」的问题由此消解。
+  macos-swift:
+    name: macOS (Swift) build + test
+    # ★ 必须是带 **SDK 26** 的镜像：Package.swift 的部署目标是 macOS 26。
+    #   镜像更旧的话 swift build 会在「'v26' is unavailable / SDK 不支持」上失败——
+    #   下面的 Select Xcode 一步会先把这件事当场喊出来，而不是让人去读编译错误。
+    runs-on: macos-26
+    # 硬超时:回归脚本的自检会真的拉起 app,任何一步挂住都不该吃掉整台
+    # runner 几小时(实测 sysproxy 自检挂过 65 分钟,整个 run 被迫手动取消,
+    # 连带 DMG 签名被跳过)。正常全程 ~10 分钟,30 分钟富余充足。
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+          fetch-depth: 0
+
+      - name: Select Xcode
+        run: |
+          set -euo pipefail
+          # swift-testing（Tests/ 里用的 @Test/#expect）要 Xcode 16+；
+          # 不固定版本，取 runner 上最新的那个即可。
+          latest="$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)"
+          echo "使用 $latest"
+          sudo xcode-select -s "$latest/Contents/Developer"
+          swift --version
+          # ★ 部署目标是 macOS 26，SDK 不够新的话后面每一步都会以一堆看不懂的
+          #   「'v26' is unavailable」收场。在这里一句话说清，省得去翻编译日志。
+          sdk="$(xcrun --sdk macosx --show-sdk-version)"
+          echo "macOS SDK: $sdk"
+          case "$sdk" in
+            [1-9]|1[0-9]|2[0-5]|[1-9].*|1[0-9].*|2[0-5].*)
+              echo "::error::macOS SDK $sdk < 26 —— Package.swift 的部署目标是 macOS 26，换带 Xcode 26+ 的 runner 镜像"
+              exit 1;;
+          esac
+
+      - name: Resolve build version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 版本口径与 Qt 那条线保持一致：major.minor 取自 CMakeLists，构建号用提交数。
+          # 刻意复用同一套编号，免得同一个 commit 在两条线上出两个不同版本号。
+          base="$(sed -nE 's/.*project[[:space:]]*\([[:space:]]*[^ ]+[[:space:]]+VERSION[[:space:]]+([0-9]+(\.[0-9]+){1,3}).*/\1/p' clashauto-c++/CMakeLists.txt | head -n 1)"
+          major="$(echo "$base" | cut -d. -f1)"
+          minor="$(echo "$base" | cut -d. -f2)"
+          count="$(git rev-list --count HEAD)"
+          version="${major}.${minor}.${count}"
+          # 主分支 = 正式版，其余分支 = prerelease。tag 再缀短 sha，
+          # 防「两个分支各 +N 撞到同一个号」。口径与 windows/linux job 完全一致。
+          if [ "$GITHUB_REF" = "refs/heads/master" ] || [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            is_pre=false; tag="v${version}"
+          else
+            is_pre=true; tag="v${version}-beta.${GITHUB_SHA:0:7}"
+          fi
+          {
+            echo "version=${version}"
+            echo "tag=${tag}"
+            echo "prerelease=${is_pre}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Release version: $version tag=$tag prerelease=$is_pre"
+
+      - name: Build
+        working-directory: macos
+        run: swift build -c release
+
+      - name: Test
+        working-directory: macos
+        run: swift test
+
+      # ★ `swift test` **盖不到这一组**：它们是 headless 自检钩子（环境变量 + exit code），
+      #   跑的是整条控制面链路（ControlApi 意图总线 → ControlServer 传输 → --mcp 协议）。
+      #   这块的产物全是 JSON，**结构写坏了编译期一点都发现不了**，而消费者在另一个进程里
+      #   （模型只会说「工具返回了看不懂的东西」），从那儿倒查回来的代价极高。
+      #   ⚠️ 这一步是补上来的：在此之前 Swift 线这九组自检**一条都没进门禁**，只有人工跑
+      #      才会执行 —— 而不进门禁的自检活不过三次重构。
+      - name: Control-plane self-tests (headless hooks)
+        working-directory: macos
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin=".build/debug/Coast"
+          [ -x "$bin" ] || bin=".build/arm64-apple-macosx/debug/Coast"
+          [ -x "$bin" ] || { echo "::error::找不到构建产物"; exit 1; }
+          # ★ 每条都要有 30 秒上限：钩子没注册时的表现是「**GUI 正常启动、永不退出**」，
+          #   不设上限就是一条挂到 job 上限的死等（本仓库栽过四次）。
+          # ★ **不能用 `timeout`**：那是 GNU coreutils 的，macOS 不带（装了也只有 `gtimeout`）。
+          #   写了就是一条与被测对象毫无关系的 "command not found"。所以用后台进程 + 轮询的
+          #   自建看门狗，不依赖任何外部命令。照搬 macos(Qt) 那条腿里已经跑通的写法。
+          # ★ 每条都给一个**自己的** COAST_CONTROL_DIR：端点目录（token/审计/socket）因此落在
+          #   临时目录里，既互不干扰，也绝不会碰到 runner 上可能存在的真实配置。
+          # ★★ 目录名必须**短**，而且要建在 /tmp 而不是 $RUNNER_TEMP 下。
+          #    unix socket 的 sun_path 在 macOS 上只有 104 字节，而 $RUNNER_TEMP 本身就是
+          #    `/var/folders/xx/<28 位随机>/T/...` 这种长路径，再拼上 `ctl-<环境变量全名>/control.sock`
+          #    就是 109 字节 —— bind 直接失败，表现成「start() 成功 FAIL」这种看不出所以然的断言红。
+          #    实测栽过（本地照 CI 跑这段时 7 条断言红），产品那侧倒是老实说了「路径太长」。
+          n=0
+          run_hook() {
+            local t="$1" out rc i dir
+            out="$RUNNER_TEMP/$t.out"
+            n=$((n + 1))
+            dir="/tmp/coastct$n"
+            rm -rf "$dir"; mkdir -p "$dir"
+            env "COAST_CONTROL_DIR=$dir" "$t=1" "$bin" >"$out" 2>&1 &
+            local pid=$!
+            for i in $(seq 1 60); do
+              kill -0 "$pid" 2>/dev/null || break
+              sleep 0.5
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+              kill -9 "$pid" 2>/dev/null || true
+              sed 's/^/      /' "$out" || true
+              echo "::error::$t 30 秒未退出 —— 多半是钩子没在 SelfTests.swift 里注册"
+              return 1
+            fi
+            set +e; wait "$pid"; rc=$?; set -e
+            if [ "$rc" != 0 ]; then
+              sed 's/^/      /' "$out" || true
+              echo "::error::$t 失败（exit=$rc）"
+              return 1
+            fi
+            echo "PASS  $t"
+          }
+          # ★ CONTROLSERVER 那条**不能**在设了 COAST_CONTROL_ALLOW_POLICY 的环境里跑：
+          #   那个逃生门会把策略级直接放行，于是「门禁挡住了没有」的断言永远通不过。
+          for t in COAST_CONTROLAPI_SELFTEST COAST_CONTROLSERVER_SELFTEST \
+                   COAST_MCP_SELFTEST COAST_CONFIRM_SELFTEST \
+                   COAST_RULEEXPLAIN_SELFTEST COAST_CHANGELOG_SELFTEST \
+                   COAST_NODEHEALTH_SELFTEST COAST_SCHEDULE_SELFTEST \
+                   COAST_CONFIGVALIDATE_SELFTEST; do
+            run_hook "$t"
+          done
+
+      - name: Check i18n coverage
+        working-directory: macos
+        run: |
+          # 只报数不拦门：漏翻会回落成中文，是个质量问题而不是坏掉。
+          # 拿它当硬性门槛会让「加一句新文案」这种小改动被 11 种语言卡住。
+          python3 scripts/i18n_check.py
+
+      # 把 Developer ID 证书导进一个用完即弃的钥匙串。**secret 没配就退回 ad-hoc** ——
+      # 这样 fork 也能构建出包（只是装不了免密 helper），而不是整条流水线红掉。
+      # 做法照搬 integemjack/schat.build 里已经跑通的那套。
+      - name: Import Developer ID cert
+        id: signcert
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PW: ${{ secrets.MACOS_CERT_PW }}
+        run: |
+          set -euo pipefail
+          if [ -z "${CERT_P12:-}" ]; then
+            echo "::notice::MACOS_CERT_P12 未配置 —— 用 ad-hoc 签名（此包装不了免密 helper）"
+            echo "identity=-" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          KC="$RUNNER_TEMP/sign.keychain-db"; KPW="$(openssl rand -base64 18)"
+          security create-keychain -p "$KPW" "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p "$KPW" "$KC"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KC" -P "${CERT_PW:-}" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KPW" "$KC" >/dev/null
+          # 把临时钥匙串挂进搜索列表，否则 codesign 找不到这个身份
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | sed 's/"//g')
+          IDENTITY=$(security find-identity -v -p codesigning "$KC" | grep -m1 "Developer ID Application" | sed -E 's/.*"(.*)".*/\1/')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          [ -n "$IDENTITY" ] || { echo "导入的证书里没有 Developer ID Application 身份"; exit 1; }
+          echo "identity=$IDENTITY" >> "$GITHUB_OUTPUT"
+
+      - name: Package Coast.app (arm64)
+        working-directory: macos
+        env:
+          # make_app.sh 默认集成最新正式版内核，要打 GitHub API 挑产物；Actions 共享
+          # 出口 IP，匿名限流（60 次/时）几乎必中 —— 必须带 token。
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/make_app.sh \
+            --version "${{ steps.ver.outputs.version }}" \
+            --universal \
+            --sign "${{ steps.signcert.outputs.identity }}"
+
+      - name: Verify bundle
+        working-directory: macos
+        run: |
+          set -euo pipefail
+          # 只做打包产物的**结构**校验——每项毫秒级、零挂死风险：
+          #   • 确实是 arm64、且**没有**混进 x86_64（这条线只发 arm64，见上一步）
+          #   • 签名封存完整（--deep --strict：浅校验在内层二进制签坏时照样报 OK）
+          #   • 种子资源 / 集成内核 / helper 布局在位（缺了要等用户首启才炸，CI 就该拦住）
+          # ★ 不在 CI 跑 scripts/regression.sh：它是本地开发工具。swift test 和 i18n
+          #   上面已各有独立步骤，再跑一遍纯重复；其自检钩子在 runner 上不是 SKIP 就是
+          #   无意义（topo 验的是 runner 的网关，helper 注册 ad-hoc 必 SKIP），sysproxy
+          #   的授权弹窗还把 Verify bundle 吊死过一个多小时。
+          lipo -archs Coast.app/Contents/MacOS/Coast | grep -q arm64
+          # 反向断言：混进 x86_64 说明 --universal 又被谁加回去了，包会白白大一倍。
+          ! lipo -archs Coast.app/Contents/MacOS/Coast | grep -q x86_64
+          lipo -archs Coast.app/Contents/MacOS/com.yuehongsun.coast.helper | grep -q arm64
+          codesign --verify --deep --strict Coast.app
+          test -f Coast.app/Contents/Library/LaunchDaemons/com.yuehongsun.coast.helper.plist
+          test -x Coast.app/Contents/MacOS/com.yuehongsun.coast.helper
+          test -f Coast.app/Contents/Resources/bundle/config/config.yaml
+          test -f Coast.app/Contents/Resources/bundle/config/Country.mmdb
+          test -x Coast.app/Contents/Resources/core
+          echo "bundle 结构 OK"
+
+      - name: Package .zip / .dmg + notarize
+        working-directory: macos
+        env:
+          SIGN_IDENTITY: ${{ steps.signcert.outputs.identity }}
+          NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.MACOS_NOTARY_ISSUER }}
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          # 名字里的架构要说实话。改名是安全的：两条线的更新器都按
+          # 「含 macos + .dmg + 不含 -qt」挑资源，不认 universal 这个词
+          # （UpdateChecker.macAsset / AppUpdater.pickAsset）——老版本照样能更新到新名字。
+          # ★ 但 `-qt` 那个标记仍是硬契约，一个字都不能动，见 CLAUDE.md。
+          ZIP="out/Coast-${VERSION}-macos-arm64.zip"
+          DMG="out/Coast-${VERSION}-macos-arm64.dmg"
+          # 更新用 zip 必须用 ditto：普通 zip 不保留 bundle 的符号链接与扩展属性，
+          # 解出来的 .app 签名当场失效。
+          ditto -c -k --keepParent Coast.app "$ZIP"
+
+          # ── 自定义 Finder 布局的 dmg（「双击运行」）─────────────────────────────────
+          # 与外部签名仓库 integemjack/schat.build 的 clashauto-mac.yml **必须保持一致**：
+          # 那边出的才是发给用户的包，这里出的只是本 run 的 artifact。放在这里跑的价值是
+          # **AppleScript 的语法错误会在本仓库就红**，不必等外部仓库那一轮。
+          #
+          # ⚠️ 窗口 bounds {200,120,740,500} = 540x380 点 ←→ 背景图 1080x760 @2x/144DPI；
+          #   图标位置 {270,150} = 背景图里凹槽的圆心。三组数改一个就要一起改，
+          #   背景图由 clashauto-c++/scripts/make_dmg_background.py 生成。
+          # ⚠️ 没有 /Applications 软链（刻意的「双击运行」）。从 dmg 直接运行时 App Translocation
+          #   会把 bundle 映射到随机只读路径、特权 helper 装不上 —— 这条由**应用自己**兜底：
+          #   不在 /Applications 就搬进去再重启（Qt: src/MacRelocate.mm，Swift: Sources/Coast/Relocate.swift）。
+          #   两件事是配套的，去掉任何一个都会让另一个变成 bug。
+          DMGSTAGE="$RUNNER_TEMP/dmg-stage"
+          rm -rf "$DMGSTAGE"; mkdir -p "$DMGSTAGE/.background"
+          ditto Coast.app "$DMGSTAGE/Coast.app"
+          if [ -f ../clashauto-c++/scripts/dmg-background.png ]; then
+            cp ../clashauto-c++/scripts/dmg-background.png "$DMGSTAGE/.background/bg.png"
+          else
+            echo "::warning::没有 dmg 背景图资产 —— 退化成朴素窗口"
+          fi
+          # ⚠️ 这个函数是在 `if ! ( layout_dmg )` 里调的，而 **`set -e` 在被当作条件求值的
+          #    命令里是失效的**（POSIX：-e 对 if/while/&&/||/! 的条件部分不生效，且递归作用到
+          #    函数体内）。所以每一步都要显式 `|| return 1` —— 靠 set -e 的话，中途失败会被
+          #    继续执行到末尾的 `rm -f "$RW"`（成功），函数遂返回 0，兜底那段**根本不会触发**。
+          #    实测代价：2026-08-10 一轮 mac 构建 convert 失败，日志里连一句「布局失败」都没有，
+          #    直接以「dmg 没生成」收尾，那一版少了一个平台的包。
+          layout_dmg() {
+            RW="$RUNNER_TEMP/coast-rw.dmg"
+            rm -f "$RW"
+            hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
+            hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDRW "$RW" || return 1
+            hdiutil attach "$RW" -noautoopen || return 1
+            sleep 2
+            osascript <<'OSA'
+          tell application "Finder"
+            tell disk "Coast"
+              open
+              set current view of container window to icon view
+              set toolbar visible of container window to false
+              set statusbar visible of container window to false
+              set the bounds of container window to {200, 120, 740, 500}
+              set vo to the icon view options of container window
+              set arrangement of vo to not arranged
+              set icon size of vo to 128
+              set text size of vo to 13
+              try
+                set background picture of vo to file ".background:bg.png"
+              end try
+              set position of item "Coast.app" of container window to {270, 150}
+              update without registering applications
+              delay 1
+              close
+            end tell
+          end tell
+          OSA
+            sync
+            # Finder 写完 .DS_Store 后不一定立刻放手 —— 直接 detach 会 "Resource busy"，
+            # 而卷没卸干净时紧接着的 convert 必然 "Resource temporarily unavailable"。
+            # 先温和重试，实在不行再 -force。
+            detached=0
+            for i in 1 2 3 4 5 6 7 8 9 10; do
+              if hdiutil detach "/Volumes/Coast" >/dev/null 2>&1; then detached=1; break; fi
+              sleep 2
+            done
+            if [ "$detached" -eq 0 ]; then
+              echo "::warning::detach 十次未成功，改用 -force"
+              hdiutil detach "/Volumes/Coast" -force || true
+              sleep 2
+            fi
+            if ! hdiutil convert "$RW" -format UDZO -o "$DMG" -ov; then
+              # 只有一行 "convert failed" 看不出是谁占着卷 —— 把挂载情况打出来。
+              echo "::warning::hdiutil convert 失败，当前挂载情况："
+              hdiutil info || true
+              return 1
+            fi
+            rm -f "$RW"
+            [ -f "$DMG" ] || return 1
+          }
+          rm -f "$DMG"
+          if ! ( layout_dmg ); then
+            # Finder 脚本在 runner 上偶发起不来（无登录会话 / AppleEvent 超时），
+            # 不该让整条腿红掉 —— 回退朴素 dmg。hdiutil 自己也偶发 "resource busy"，重试几次。
+            echo "::warning::自定义 dmg 布局失败 —— 回退朴素 dmg"
+            rm -f "$DMG"
+            for attempt in 1 2 3 4; do
+              hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
+              hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDZO "$DMG" && break
+              echo "hdiutil create 失败（第 $attempt/4 次），8 秒后重试"; sleep 8
+            done
+          fi
+          [ -f "$DMG" ] || { echo "ERROR: dmg 没生成"; exit 1; }
+
+          # 公证 + 装订。**只在真签且有公证凭据时做**；一旦开做就必须成功 ——
+          # 政策是「release 里绝不放未公证的包」，所以这里失败即整步失败、artifact 不上传，
+          # 而不是悄悄发一个用户双击会被 Gatekeeper 拦下的东西。
+          if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ] && [ -n "${NOTARY_KEY:-}" ]; then
+            echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/nkey.p8"
+            xcrun notarytool submit "$DMG" \
+              --key "$RUNNER_TEMP/nkey.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" \
+              --wait --timeout 45m
+            xcrun stapler staple "$DMG"
+            xcrun stapler validate "$DMG"
+            rm -f "$RUNNER_TEMP/nkey.p8"
+            echo "公证 + 装订完成"
+          else
+            echo "::notice::未真签或未配公证凭据 —— 跳过公证（此包会被 Gatekeeper 拦下，仅供开发验证）"
+          fi
+          ls -la out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Coast-swift-macos-arm64
+          path: macos/out/*
+          if-no-files-found: error
+
+      # ★ 不在这里发 Release，也**不在这里触发签名** —— 触发收敛到独立的 `trigger-mac` job
+      #   （见上）：Swift 与 Qt 两条线是同一分支上的 on:push，各自推一次提交必然撞车
+      #   （非快进被拒，而且失败得很隐蔽：另一条线静默地没被签）。
+      #   本 job 的职责就两件：把 Swift 端编过 + 测过，留一份未签名产物供排查。
