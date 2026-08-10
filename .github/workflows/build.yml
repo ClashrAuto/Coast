@@ -45,8 +45,8 @@ permissions:
 #   与下一轮互不相干；客户端对这种包是「挑不到自己平台的资产 → 判无更新」，不会装错。
 concurrency:
   group: >-
-    coast-build-${{ env.SOURCE_REF }}-${{
-      (env.SOURCE_REF == 'master' || env.SOURCE_REF == 'main') && github.run_id || 'shared'
+    coast-build-${{ (github.event.inputs.ref || github.event.client_payload.ref || 'master') }}-${{
+      ((github.event.inputs.ref || github.event.client_payload.ref || 'master') == 'master' || (github.event.inputs.ref || github.event.client_payload.ref || 'master') == 'main') && github.run_id || 'shared'
     }}
   cancel-in-progress: true
 
