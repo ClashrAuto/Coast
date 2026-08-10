@@ -1429,10 +1429,31 @@ jobs:
           #   有核心把关，其实一次都没跑过）。"坏配置能被判出来"那半边要有内核才验得了，
           #   已在有内核的机器上验过，见 ConfigValidator::runSelfTest 的说明。
           run_selftest COAST_CONFIGVALIDATE_SELFTEST
-          # 没加进来的三个，各有原因，别顺手补上：
+          # ↓ 2026-08-11 补进来的六个：都是纯逻辑、无网络、秒级返回，本机实测 rc=0。
+          #   它们此前**一个都没跑过** —— main_qml.cpp 注册了 39 个钩子，而 CI 全链路
+          #   （release.yml + validate/*.sh）只覆盖 17 个。少跑一个的代价不是"少一层保险"：
+          #   钩子这套东西的失败方式是**挂住而不是报错**（见 run_selftest 里 124 的诊断），
+          #   而 CI 跑它们正是那个安全网本身。
+          run_selftest COAST_MANIFEST_SELFTEST     # 版本清单解析/合并
+          run_selftest COAST_SETTINGS_SELFTEST     # 设置页读写
+          run_selftest COAST_SUBS_SELFTEST         # 订阅存储
+          run_selftest COAST_HISTORY_SELFTEST      # 浏览历史库
+          run_selftest COAST_DEVICEDB_SELFTEST     # 设备台账
+          run_selftest COAST_CONNSTATS_SELFTEST    # 连接分桶统计
+          # 剩下的没加进来，各有原因，别顺手补上（这份名单以前写成"三个"，实际是这些）：
           #   · COAST_TUNSERVICE_SELFTEST —— 会**真的接管默认路由**，要 root 且只能在可牺牲
           #     网络的机器上跑；在 runner 上跑等于把这个 job 的网络掀了。
+          #     （另：它当前在干净机器上必然失败，见 TunEndpoint_win.cpp 的 locateWintun。）
           #   · COAST_SELFROUTE_SELFTEST  —— 同类，动的是策略路由。
+          #   · COAST_PF_SELFTEST / COAST_TPROXY_SELFTEST —— 装内核规则层，要 root。
+          #   · COAST_SMOLGW_REALNIC_SELFTEST —— 要一块真网卡。
+          #   · COAST_SCAN_SELFTEST —— **真去扫局域网**：本机实测 10 秒、报 22 台设备。
+          #     runner 上结果取决于它所在的网段，是典型的会间歇性翻脸的用例。
+          #   · COAST_GW_COASTCORE_SELFTEST —— 只在 Windows + COAST_RUST 下注册（见
+          #     RustStackSelfTest.cpp），放进这条通用列表会在 Linux/macOS 上恒挂 124。
+          #     （同一文件里的 RUSTSTACK / SMOLGW / SOCKSUDPUSER 已由 Windows 腿单独跑。）
+          #   · COAST_ISSUE_SELFTEST / COAST_QUIT_SELFTEST —— rc=0 但**不打任何输出**，
+          #     没法判断它们到底断言了什么；先弄清再决定，不能拿"退出码 0"当通过。
           #   · COAST_OUTBOUND_PROBE      —— 要 full.yaml + 节点名才有意义，不带参数时打用法
           #     退出 2，当断言用只会是一条恒红。
 
