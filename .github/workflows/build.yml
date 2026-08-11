@@ -76,59 +76,6 @@ env:
 #    只能动态链，所以 .deb 仍有一串 Depends（但 Qt 自己一个都不占了）。
 
 jobs:
-  # 「无大括号的控制语句后跟了两条同缩进语句」——只有第一条真被守卫。
-  # CMakeLists 已把 GCC/Clang 的 -Wmisleading-indentation 设为错误，但那道门禁在 CI 里
-  # **漏掉了最需要它的文件**：Windows 专属源（NetStack.cpp、L2Endpoint_win.cpp…）在 CI 中
-  # 只被 MSVC 编译，而 MSVC 没有等价警告；macOS 专属源两边 GCC 也都碰不到。
-  # 2026-08-06 一晚踩了三处，两处正好落在 Windows 专属文件里（一处让诊断数据常年说谎并
-  # 越界读 f[-1]，一处是取消代理时的空指针解引用）。这个检查与平台无关，30 秒跑完。
-  # 脚本自带变异测试记录：对上述两个真 bug 分别注入验证过会红（见脚本头注释）。
-  lint-indent:
-    name: Misleading-indentation scan
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_REF }}
-          token: ${{ secrets.SOURCE_TOKEN || github.token }}
-      - run: python3 clashauto-c++/scripts/check_misleading_indent.py
-      # Qt 线的 i18n 门禁。Swift 线早就有一份，本线一直没有 —— 而它挡的是**静默**失效：
-      # qsTr 的串不在语言表里时，Qt 退回源串，于是 11 种语言全显示中文、零报错，
-      # 而开发机上完全看不出来（开发者用的就是中文）。第一次跑就找出 3 条漏译。
-      # 放在这条腿上：纯 Python，不需要任何构建产物，几秒钟出结果。
-      - run: python3 clashauto-c++/scripts/i18n_check.py
-      # ★ 定位器（Row/Column/Grid/Flow）的**直接子项**写了被禁的 anchors。Qt 的反应不是
-      #   忽略那一条，而是让**整个定位器停止排版**（"Row will not function"）：子项全部
-      #   堆到原点，而且那条 anchors 自身也不生效 —— MouseArea 会变成 0×0，那块**点不动**。
-      #   构建期零信号；运行期只有该组件真被实例化时才打一行警告，开发机上很容易一直看不见。
-      #   2026-08-10 实测：出货的 v1.0.1143 里 ConfirmOverlay 的「5 分钟内不再询问」勾选框
-      #   就是这样既错位又点不动的，是从 validate 的无头运行日志里翻出来的。
-      #   ★ 先跑它自己的自检：第一版是**按行**扫的，单行写法
-      #     `MouseArea { anchors.fill: parent }` 整个不可见 —— 合成用例里三条该命中的一条都
-      #     没抓到，只因真实那处碰巧是多行才显得能用，还就这么进了 CI。只在特定排版下生效的
-      #     门禁比没有门禁更危险：它让人以为这一类已经被挡住了。
-      - run: python3 clashauto-c++/scripts/qml_positioner_check.py --selftest
-      - run: python3 clashauto-c++/scripts/qml_positioner_check.py clashauto-c++/qml clashauto-c++/installer/ui/qml
-      # ★ 「算版本号」那段在每个 job 里各有一份，必须逐字一致。不一致 = 同一个 commit
-      #   算出两个 tag：产物传到 A，trigger-mac 通知 schat.build 发到 B，两边 CI 全绿而
-      #   release 是劈开的（2026-08-10 实测劈过一次）。2026-08-11 又发现 macos-swift 那份
-      #   漏了 minor 兜底，而它的注释还写着「口径与 windows/linux job 完全一致」——
-      #   这种事人眼核对不可靠。
-      - run: python3 clashauto-c++/scripts/version_recipe_check.py
-      # 安装器原生侧那张语言表（25 句 × 13 语言 = 325 格）是**生成物**。生成物的经典
-      # 隐患是有人直接手改产物：改动能编、能跑、能过自检，然后下一次跑生成器时被
-      # **静默还原** —— 而那时改的人早忘了这回事，只会看到「我明明改过的文案又变回去了」。
-      # 所以重跑一遍生成器，断言工作树没有任何变化。
-      - name: NativeStrings.h 与生成器一致
-        run: |
-          python3 clashauto-c++/scripts/gen_native_strings.py
-          if ! git diff --exit-code -- clashauto-c++/installer/core/NativeStrings.h; then
-            echo "::error::NativeStrings.h 与 scripts/gen_native_strings.py 的产物不一致 —— \
-          它是生成物，改文案要改生成器再重新生成，别直接改头文件"
-            exit 1
-          fi
-
   windows:
     name: Windows ${{ matrix.arch }}
     runs-on: windows-2022
@@ -829,7 +776,9 @@ jobs:
         run: |
           set -euo pipefail
           brew install ninja
-          # pillow 用来从 icon.ico 生成 icns；aqtinstall 不再需要（Qt 改为自己编的静态版）。
+          # pillow 给 scripts/check_macos_icon.py 用（量 .app 里图标的几何）。
+          # ⚠️ 它**不再**用来生成 icns —— 那一步已删，理由见下面 Configure 上方那段。
+          # aqtinstall 不再需要（Qt 改为自己编的静态版）。
           python3 -m pip install --user pillow \
             || python3 -m pip install --user --break-system-packages pillow
 
@@ -848,27 +797,26 @@ jobs:
         shell: bash
         run: echo "QT_ROOT=${{ steps.qt.outputs.qt-root }}" >> "$GITHUB_ENV"
 
-      - name: Generate icon.icns
-        shell: bash
-        run: |
-          set -euo pipefail
-          # 从 assets/icon.ico 取最大帧生成 iconset → icns；CMake 检测到该文件即打进 Resources
-          python3 - <<'PY'
-          from PIL import Image
-          import pathlib
-
-          ico = Image.open("clashauto-c++/assets/icon.ico")
-          sizes = sorted(ico.info.get("sizes") or {ico.size})
-          ico.size = sizes[-1]
-          ico.load()
-          base = ico.convert("RGBA")
-          out = pathlib.Path("icon.iconset")
-          out.mkdir(exist_ok=True)
-          for s in (16, 32, 128, 256, 512):
-              base.resize((s, s), Image.LANCZOS).save(out / f"icon_{s}x{s}.png")
-              base.resize((s * 2, s * 2), Image.LANCZOS).save(out / f"icon_{s}x{s}@2x.png")
-          PY
-          iconutil -c icns -o clashauto-c++/assets/icon.icns icon.iconset
+      # ★ 这里**不要**再生成 icon.icns。`clashauto-c++/assets/icon.icns` 是入库的成品，
+      #   CMake 用 `if(EXISTS)` 直接打进 Resources。
+      #
+      #   删掉的那一步是「从 assets/icon.ico 取最大帧 → iconutil 生成 icns」，它有两个后果，
+      #   都只在 Dock 里看得出来、任何构建/打包检查都不会红：
+      #   ① `icon.ico` 是**全出血**方图（Windows 任务栏就该是全出血），拿它直接生成的 icns
+      #      在 macOS 的图标网格里**填满整格**——比左右邻居大一圈，而且是方角。macOS 的网格
+      #      要求圆角贴片只占画布的 824/1024 ≈ 80.5%（每边 100px 透明留白）再加一层轻投影，
+      #      所有原生 app 才会"看起来一样大"。
+      #   ② `.ico` 最大帧只有 256，升采样到 1024 还会糊。
+      #   这也正是为什么**只有 Qt 这条线**有这个毛病：`macos-swift` 那个 job 没有这一步，
+      #   `make_app.sh` 拷的就是入库的这份 icns。
+      #
+      #   要改图标：换掉全出血的 `assets/icon-source-1024.png`，再跑
+      #   `python3 clashauto-c++/scripts/make_macos_icns.py`（需要 macOS 的 iconutil），
+      #   把重新生成的 icon.icns 提交进来。`icon.ico` / `icon-256.png` 保持全出血别动。
+      #
+      #   ⚠️ **同一步在 `integemjack/schat.build` 的 `clashauto-mac-qt.yml` 里也有一份**
+      #      （分支 clashauto-mac），而用户拿到的签名包是那边出的 —— 只删这边不改那边，
+      #      出货的图标依旧是坏的。两处必须一起删。
 
       - name: Configure
         shell: bash
@@ -901,6 +849,21 @@ jobs:
             echo "::error::静态化没生效 —— Coast 仍动态依赖 Qt"
             exit 1
           fi
+
+      # ★ 量 **.app 里那一份**图标，不是量入库的源文件。
+      #   2026-08-12 的事故正是这个差别：入库的 icon.icns 当时是对的，而本 job 有一步
+      #   从全出血的 icon.ico 现生成 icns **覆盖**了它 —— 覆盖发生在 checkout 之后，
+      #   只有产物里有痕迹。出货的图标是 100% 满格方图，在 Dock 里比邻居大一圈，
+      #   而构建/打包/签名没有任何一环会红（Swift 那条线没这一步，所以"换个平台就好了"
+      #   还会把人往图本身的方向带）。这一步就是补上那个唯一能观测到的位置。
+      #   两个都查：入库的那份 + 打进 bundle 的那份，任何一个被弄坏都红。
+      - name: macOS 图标合网格（量 .app 里的那一份）
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 clashauto-c++/scripts/check_macos_icon.py \
+            clashauto-c++/assets/icon.icns \
+            "$BUILD_DIR/Coast.app/Contents/Resources/icon.icns"
 
       - name: Static plugin self-test
         shell: bash
@@ -939,7 +902,7 @@ jobs:
             set +e; wait "$pid"; rc=$?; set -e
             if [ "$rc" != 0 ]; then
               sed 's/^/      /' "$out" || true
-              echo "::error::$t 失败（exit=$rc）"
+              echo "::error::${t} 失败（exit=${rc}）"
               return 1
             fi
             echo "PASS  $t"
@@ -1126,78 +1089,18 @@ jobs:
           方法二：终端执行 xattr -cr "/Applications/Coast.app" 后正常双击。
           EOF
           fi
-          # ⚠️ 这个函数是在 `if ! ( layout_dmg )` 里调的，而 **`set -e` 在被当作条件求值的
-          #    命令里是失效的**（POSIX：-e 对 if/while/&&/||/! 的条件部分不生效，且递归作用到
-          #    函数体内）。所以每一步都要显式 `|| return 1` —— 靠 set -e 的话，中途失败会被
-          #    继续执行到末尾的 `rm -f "$RW"`（成功），函数遂返回 0，兜底那段**根本不会触发**。
-          #    实测代价：2026-08-10 一轮 mac 构建 convert 失败，日志里连一句「布局失败」都没有，
-          #    直接以「dmg 没生成」收尾，那一版少了一个平台的包。
-          layout_dmg() {
-            RW="$RUNNER_TEMP/coast-rw.dmg"
-            rm -f "$RW"
-            hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
-            hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDRW "$RW" || return 1
-            hdiutil attach "$RW" -noautoopen || return 1
-            sleep 2
-            osascript <<'OSA'
-          tell application "Finder"
-            tell disk "Coast"
-              open
-              set current view of container window to icon view
-              set toolbar visible of container window to false
-              set statusbar visible of container window to false
-              set the bounds of container window to {200, 120, 740, 500}
-              set vo to the icon view options of container window
-              set arrangement of vo to not arranged
-              set icon size of vo to 128
-              set text size of vo to 13
-              try
-                set background picture of vo to file ".background:bg.png"
-              end try
-              set position of item "Coast.app" of container window to {270, 150}
-              try
-                set position of item "打开说明.txt" of container window to {470, 320}
-              end try
-              update without registering applications
-              delay 1
-              close
-            end tell
-          end tell
-          OSA
-            sync
-            # Finder 写完 .DS_Store 后不一定立刻放手 —— 直接 detach 会 "Resource busy"，
-            # 而卷没卸干净时紧接着的 convert 必然 "Resource temporarily unavailable"。
-            # 先温和重试，实在不行再 -force。
-            detached=0
-            for i in 1 2 3 4 5 6 7 8 9 10; do
-              if hdiutil detach "/Volumes/Coast" >/dev/null 2>&1; then detached=1; break; fi
-              sleep 2
-            done
-            if [ "$detached" -eq 0 ]; then
-              echo "::warning::detach 十次未成功，改用 -force"
-              hdiutil detach "/Volumes/Coast" -force || true
-              sleep 2
-            fi
-            if ! hdiutil convert "$RW" -format UDZO -o "$DMG" -ov; then
-              # 只有一行 "convert failed" 看不出是谁占着卷 —— 把挂载情况打出来。
-              echo "::warning::hdiutil convert 失败，当前挂载情况："
-              hdiutil info || true
-              return 1
-            fi
-            rm -f "$RW"
-            [ -f "$DMG" ] || return 1
-          }
-          rm -f "$DMG"
-          if ! ( layout_dmg ); then
-            echo "::warning::自定义 dmg 布局失败 —— 回退朴素 dmg"
-            rm -f "$DMG"
-            for attempt in 1 2 3 4; do
-              hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
-              hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDZO "$DMG" && break
-              echo "hdiutil create 失败（第 $attempt/4 次），8 秒后重试"; sleep 8
-            done
-          fi
-          [ -f "$DMG" ] || { echo "ERROR: dmg 没生成"; exit 1; }
+          # ★ 布局 + 兜底整段收在 clashauto-c++/scripts/make_dmg.sh 里，**四个使用方共用一份**：
+          #   本仓库的 macos / macos-swift 两个 job，以及 integemjack/schat.build 的
+          #   clashauto-mac-qt.yml / clashauto-mac.yml（后两者才是用户拿到的签名包，
+          #   而它们检出的就是本仓库的源码，所以直接调这个文件即可）。
+          #   2026-08-12 对账发现那两份还停在 2026-08-10 那次事故之前的写法：函数体里写
+          #   `set -e` 就以为够了，一处 `|| return 1` 都没有 —— 而 `set -e` 对被当作条件
+          #   求值的命令是失效的，于是 convert 失败时函数照样返回 0、兜底根本不触发，
+          #   release 静默少一个平台的包。收敛成一份之后这种漂移在结构上不再可能。
+          # ⚠️ 用 $GITHUB_WORKSPACE 而不是相对路径：macos-swift 那一步带着
+          #    `working-directory: macos`，相对路径在那里解析不到 —— 表现是 exit 127
+          #    （command not found），而 127 看着像"脚本内部出错"，其实是根本没找到脚本。
+          bash "$GITHUB_WORKSPACE/clashauto-c++/scripts/make_dmg.sh" "$DMGSTAGE" "$DMG" Coast Coast.app
           # 公证 + staple：仅在真签名 + 有 notary 凭据时（Apple 拒绝 ad-hoc 提交）。
           # 用 App Store Connect API Key(.p8)；失败则本步失败 → 不上传未公证的 dmg。
           if [ -n "${SIGN_IDENTITY:-}" ] && [ "$SIGN_IDENTITY" != "-" ] && [ -n "${NOTARY_KEY:-}" ]; then
@@ -1441,17 +1344,43 @@ jobs:
           #   钩子这套东西的失败方式是**挂住而不是报错**（见 run_selftest 里 124 的诊断），
           #   而 CI 跑它们正是那个安全网本身。
           run_selftest COAST_MANIFEST_SELFTEST     # 版本清单解析/合并
+          # ★ 订阅解析：955 行，解析的是**订阅服务器给的内容**（不可信输入），产物直接进
+          #   full.yaml。它此前一条测试都没有，而两类失败都极其安静：名字里一个裸控制字符
+          #   让核心拒绝**整份配置**（代理全停，不是少一个节点）；凭据取错则节点建得出来、
+          #   看着正常，连上去认证必然失败且无一处报错。
+          run_selftest COAST_SUBPARSER_SELFTEST    # 订阅 URI → Clash proxies
+          # ★ 节点名往返：proxies 里双引号写、代理组里单引号引用，两边必须解出同一个
+          #   字符串。不一致的表现不是「少一个节点」，是核心拒绝**整份配置**（组引用了一个
+          #   不存在的节点）—— 而名字里的 \ 和 " 都能从订阅的 URI 片段（%5C / %22）里来。
+          run_selftest COAST_YAMLNAME_SELFTEST     # 节点名 双引号↔单引号 往返
           run_selftest COAST_SETTINGS_SELFTEST     # 设置页读写
           run_selftest COAST_SUBS_SELFTEST         # 订阅存储
           run_selftest COAST_HISTORY_SELFTEST      # 浏览历史库
           run_selftest COAST_DEVICEDB_SELFTEST     # 设备台账
           run_selftest COAST_CONNSTATS_SELFTEST    # 连接分桶统计
+
+          # ★ TPROXY **规则层**（不是数据面）：装 nft + 策略路由 → 核对 → 增删设备 → 拆 →
+          #   核对拆干净。以前因为「要 root」被排除在外，而 2026-08-11 在真 Linux 上跑过之后
+          #   发现那个理由站不住：它**不需要台账也不需要真设备**（设备集合为空时规则一条都不
+          #   命中，不改路由决策），跑完 `ip rule` 回到三条默认、没有 coast 表、网关仍可达。
+          #   runner 上是 root，所以能跑。
+          # ⚠️ **判据不能是「有没有 nft 这个命令」** —— 我第一版就是那么写的，结果两条腿
+          #   都红了：runner 上 `nft` 装着，但它是容器化环境，**真去建表会被内核拒**
+          #   （缺 NET_ADMIN / 相应模块）。命令在 ≠ 能装表。
+          #   现在先真建一张一次性的探针表：建得起来才跑自检，建不起来就明说跳过。
+          #   探针本身也要拆干净，别把痕迹留给后面的步骤。
+          if nft add table inet coast_ci_probe >/dev/null 2>&1; then
+            nft delete table inet coast_ci_probe >/dev/null 2>&1 || true
+            run_selftest COAST_TPROXY_SELFTEST     # 内核规则层：装载 / 增删 / 幂等拆除
+          else
+            echo "::warning::跳过 COAST_TPROXY_SELFTEST —— 这台 runner 上建不了 nft 表（容器化环境常见）"
+          fi
           # 剩下的没加进来，各有原因，别顺手补上（这份名单以前写成"三个"，实际是这些）：
           #   · COAST_TUNSERVICE_SELFTEST —— 会**真的接管默认路由**，要 root 且只能在可牺牲
           #     网络的机器上跑；在 runner 上跑等于把这个 job 的网络掀了。
           #     （另：它当前在干净机器上必然失败，见 TunEndpoint_win.cpp 的 locateWintun。）
           #   · COAST_SELFROUTE_SELFTEST  —— 同类，动的是策略路由。
-          #   · COAST_PF_SELFTEST / COAST_TPROXY_SELFTEST —— 装内核规则层，要 root。
+          #   · COAST_PF_SELFTEST —— 装 pf 规则层，要 root 且只有 macOS。
           #   · COAST_SMOLGW_REALNIC_SELFTEST —— 要一块真网卡。
           #   · COAST_SCAN_SELFTEST —— **真去扫局域网**：本机实测 10 秒、报 22 台设备。
           #     runner 上结果取决于它所在的网段，是典型的会间歇性翻脸的用例。
@@ -1544,6 +1473,64 @@ jobs:
           # 在几分钟后才作为 v1.10.4414 发布，于是发布包里的内核只带了一半修复。
           # 版本号进了日志，这种事至少能在事后一眼看出来。
           echo "集成内核自报版本: $("$STAGE_DIR/core" -v | head -1)"
+
+      # ★★ 让**真核心**判一遍我们生成的 full.yaml —— CLAUDE.md 说这是「改动配置生成时
+      #    最要紧的一道检查」，而在此之前 CI 里**一次都没跑过**：所有 YAML 都是手拼字符串，
+      #    坏了编译期零信号，运行期的表现是核心拒绝加载**整份配置**（代理整个起不来，
+      #    不是某个功能失效）。此前只能靠人在本机手动验，回归全靠自觉。
+      #
+      #    放在这一步是因为**只有这条腿同时具备三样东西**：构建出来的二进制、刚下载的
+      #    真内核、以及仓库里的 Country.mmdb。lint 腿没有内核（它那边验的是 fail-open）。
+      #
+      #    ⚠️ `-d <dir>` 里必须有 Country.mmdb：缺了的话核心会去下载 GeoIP 然后**超时**，
+      #       而那个失败读起来像配置错误 —— 会把人引向完全错误的方向。
+      #    ⚠️ 判据用**核心那句话**而不是退出码：退出码在两种内核行为下含义不同，
+      #       而 `configuration file … test failed` 这句在两种下都成立，还带着原因。
+      - name: 真核心复核生成的 full.yaml
+        shell: bash
+        run: |
+          set -euo pipefail
+          gen="$(mktemp -d)"
+          cp clashauto-c++/assets/bundle/config/Country.mmdb "$gen/"
+          # NICEGRESS 会真的跑一遍 ensureFullConfig 并把产物路径打出来
+          # 与同一条腿里的 run_selftest 一致：`env NAME=1` + 30 秒看门狗。挂住而不是报错
+          # 是这套钩子的典型失败方式（见 run_selftest 里 124 的诊断）。
+          #
+          # ★ `QT_QPA_PLATFORM=offscreen` 不能省，而且**必须在这一步自己设**：
+          #   自检那一步里是 `export QT_QPA_PLATFORM=offscreen`，而 export 只在**那一步的
+          #   shell** 里有效 —— 每个 step 都是新起的 shell。少了它，runner 上没有显示服务，
+          #   Qt 找不到平台插件直接 abort（rc=134）。实测这一步第一版就是这么红的，
+          #   而同一个钩子在前面那步是绿的，看着像「同样的命令时灵时不灵」。
+          #   （同一个坑我在无头 Linux 机上先撞过一次，27 个钩子全 rc=134。）
+          export QT_QPA_PLATFORM=offscreen
+          out="$(timeout 30 env COAST_NICEGRESS_SELFTEST=1 "$BUILD_DIR/coast" 2>&1)" || {
+            echo "::error::COAST_NICEGRESS_SELFTEST 没能正常跑完（超时或非零退出）"
+            printf '%s\n' "$out" | tail -20
+            exit 1
+          }
+          # ⚠️ `|| true` 不能省：这一步是 `set -euo pipefail`，而 `grep` 找不到时返回 1，
+          #    于是**赋值语句本身**就会终止脚本 —— 下面那段「拿不到路径」的诊断永远执行不到，
+          #    留给人的只有一个退出码。（同一形状的死诊断在 mac CI 里栽过一次，见 CLAUDE.md。）
+          cfg="$(printf '%s\n' "$out" | grep -oE '/[^ ]*full\.yaml' | tail -1 || true)"
+          if [ -z "$cfg" ] || [ ! -s "$cfg" ]; then
+            echo "::error::拿不到生成的 full.yaml —— NICEGRESS 的输出里没有路径"
+            printf '%s\n' "$out" | tail -20
+            exit 1
+          fi
+          echo "待判配置: $cfg（$(wc -l < "$cfg") 行）"
+          verdict="$("$STAGE_DIR/core" -t -f "$cfg" -d "$gen" 2>&1 || true)"
+          if printf '%s\n' "$verdict" | grep -qi 'test failed'; then
+            echo "::error::核心判定生成的配置不合法 —— 代理会整个起不来"
+            printf '%s\n' "$verdict" | grep -Ei 'error|failed' | head -20 \
+              | sed 's/^/::error::core: /'
+            exit 1
+          fi
+          if ! printf '%s\n' "$verdict" | grep -qi 'test is successful'; then
+            echo "::error::核心既没说成功也没说失败 —— 判据失效了，别当它通过"
+            printf '%s\n' "$verdict" | tail -20
+            exit 1
+          fi
+          echo "核心判定：合法"
 
       - name: Create portable tar.gz
         shell: bash
@@ -1844,18 +1831,6 @@ jobs:
           chmod +x "$BIN"
           bash validate/gateway_selftest.sh "$BIN"
 
-  # macOS **两条产品线的正式包都不在本 CI 打**（本仓库没有、也不该有 Developer ID 私钥）
-  # ——由外部构建仓库的「专用分支」承载（该分支已配签名+公证 secret，workflow 用 on:push
-  # 监听本分支）。本 job 用 PAT 往那个分支推一个空提交，参数写在提交说明里；对方 checkout
-  # clashauto 的**同一个 sha** 从头构建、签名、公证，再发到本次 release 的 tag 上：
-  #   product: coast-swift → clashauto-mac.yml    → Coast-<ver>-macos-universal.dmg
-  #   product: coast-qt    → clashauto-mac-qt.yml → Coast-<ver>-macos-universal-qt.dmg
-  # 打包内容完全不在外部仓库的默认分支上。
-  # 目标仓库地址/令牌/分支都放本仓库 Secrets，不在代码里明文暴露：
-  #   SCHAT_BUILD_REPO   —— 目标仓库 owner/repo
-  #   SCHAT_BUILD_TOKEN  —— 对该仓库有 contents:write 的 PAT
-  #   SCHAT_BUILD_BRANCH —— 专用打包分支名（可选，缺省 clashauto-mac）
-  # 必需 secret（REPO/TOKEN）未配置时本 job 自动跳过（不失败）。
   trigger-mac:
     name: Trigger signed macOS builds (Swift + Qt)
     # 只依赖 windows（release 由它创建，mac DMG 随后追加）；mac 签名与 linux 无关，
@@ -2056,9 +2031,27 @@ jobs:
         working-directory: macos
         run: swift build -c release
 
+      # ★ 失败详情必须走 `::error::` 注解 —— 本仓库的 job 日志要仓库管理员权限才看得到，
+      #   而**注解是公开可读的**（qt-static 那边把每个模块的耗时发成 ::warning:: 同理）。
+      #   原来这一步是裸的 `swift test`，于是一次失败只能拿回一个退出码：2026-08-11 实测
+      #   macos-swift 红了一轮，而那次推送**只改了一个 .md 文件**，从注解里完全看不出是
+      #   哪条用例挂了，连"是不是偶发"都判不了。这条腿里有若干带真实进程与秒级超时的
+      #   E2E 用例（RealCore / SpeedProbe / Reconnect / CoreCrash），偶发是常态，
+      #   所以"能一眼看出是哪条"比什么都重要。
       - name: Test
         working-directory: macos
-        run: swift test
+        shell: bash
+        run: |
+          set -o pipefail
+          if swift test 2>&1 | tee /tmp/swift-test.log; then
+            exit 0
+          fi
+          # Swift Testing 用 `✘`，XCTest 用 `error:` / `failed`；两种都捞。
+          # 注解有条数上限，取前 20 条足够定位。
+          grep -E '✘|error:|[Ff]ailed' /tmp/swift-test.log \
+            | head -20 \
+            | sed 's/^/::error::swift test: /' || true
+          exit 1
 
       # ★ `swift test` **盖不到这一组**：它们是 headless 自检钩子（环境变量 + exit code），
       #   跑的是整条控制面链路（ControlApi 意图总线 → ControlServer 传输 → --mcp 协议）。
@@ -2108,7 +2101,7 @@ jobs:
             set +e; wait "$pid"; rc=$?; set -e
             if [ "$rc" != 0 ]; then
               sed 's/^/      /' "$out" || true
-              echo "::error::$t 失败（exit=$rc）"
+              echo "::error::${t} 失败（exit=${rc}）"
               return 1
             fi
             echo "PASS  $t"
@@ -2119,9 +2112,25 @@ jobs:
                    COAST_MCP_SELFTEST COAST_CONFIRM_SELFTEST \
                    COAST_RULEEXPLAIN_SELFTEST COAST_CHANGELOG_SELFTEST \
                    COAST_NODEHEALTH_SELFTEST COAST_SCHEDULE_SELFTEST \
-                   COAST_CONFIGVALIDATE_SELFTEST; do
+                   COAST_CONFIGVALIDATE_SELFTEST \
+                   COAST_SETTINGS_SELFTEST COAST_SUBS_SELFTEST \
+                   COAST_CONNSTATS_SELFTEST COAST_HISTORY_SELFTEST \
+                   COAST_COREPICK_SELFTEST COAST_SUBPARSER_SELFTEST \
+                   COAST_YAMLNAME_SELFTEST; do
             run_hook "$t"
           done
+          # ★ 后面这四条 2026-08-11 才补，之前 Swift 线**两处都没跑过**。
+          #   补之前在真 Mac 上逐个验过，结论不是靠读代码猜的：
+          #   · SETTINGS / SUBS 里的 `exit(1)` 是**断言失败**，不是「环境为空就退出」——
+          #     `AppConfigLoader.load()` 在 config.yaml 缺失时会从内置种子补种、种子也没有
+          #     就退回默认值，**永不抛错**；干净 runner 上 SUBS 走「没有订阅 → SKIP exit 0」。
+          #     所以这两条在 runner 上不会恒红。
+          #   · 它们原本会把用户**真实**的 config.yaml / subscribe.yaml 改掉且不还原
+          #     （实测把节点「HK-1」留在了禁用态），已在同一轮里改成写完还原 —— 干净 runner
+          #     看不出这个差别，但开发者在自己机器上跑一次就中招，所以必须先修再接。
+          # ⚠️ COAST_DEVICEDB_SELFTEST **不要加进来**：Swift 线**根本没有**这个钩子
+          #   （实测 rc=2「没有任何 if 认领它」），加了就是一条与被测对象无关的红。
+          #   它只在 Qt 线存在 —— 别照着 Qt 的名单平移。
 
       - name: Check i18n coverage
         working-directory: macos
@@ -2235,77 +2244,18 @@ jobs:
           else
             echo "::warning::没有 dmg 背景图资产 —— 退化成朴素窗口"
           fi
-          # ⚠️ 这个函数是在 `if ! ( layout_dmg )` 里调的，而 **`set -e` 在被当作条件求值的
-          #    命令里是失效的**（POSIX：-e 对 if/while/&&/||/! 的条件部分不生效，且递归作用到
-          #    函数体内）。所以每一步都要显式 `|| return 1` —— 靠 set -e 的话，中途失败会被
-          #    继续执行到末尾的 `rm -f "$RW"`（成功），函数遂返回 0，兜底那段**根本不会触发**。
-          #    实测代价：2026-08-10 一轮 mac 构建 convert 失败，日志里连一句「布局失败」都没有，
-          #    直接以「dmg 没生成」收尾，那一版少了一个平台的包。
-          layout_dmg() {
-            RW="$RUNNER_TEMP/coast-rw.dmg"
-            rm -f "$RW"
-            hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
-            hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDRW "$RW" || return 1
-            hdiutil attach "$RW" -noautoopen || return 1
-            sleep 2
-            osascript <<'OSA'
-          tell application "Finder"
-            tell disk "Coast"
-              open
-              set current view of container window to icon view
-              set toolbar visible of container window to false
-              set statusbar visible of container window to false
-              set the bounds of container window to {200, 120, 740, 500}
-              set vo to the icon view options of container window
-              set arrangement of vo to not arranged
-              set icon size of vo to 128
-              set text size of vo to 13
-              try
-                set background picture of vo to file ".background:bg.png"
-              end try
-              set position of item "Coast.app" of container window to {270, 150}
-              update without registering applications
-              delay 1
-              close
-            end tell
-          end tell
-          OSA
-            sync
-            # Finder 写完 .DS_Store 后不一定立刻放手 —— 直接 detach 会 "Resource busy"，
-            # 而卷没卸干净时紧接着的 convert 必然 "Resource temporarily unavailable"。
-            # 先温和重试，实在不行再 -force。
-            detached=0
-            for i in 1 2 3 4 5 6 7 8 9 10; do
-              if hdiutil detach "/Volumes/Coast" >/dev/null 2>&1; then detached=1; break; fi
-              sleep 2
-            done
-            if [ "$detached" -eq 0 ]; then
-              echo "::warning::detach 十次未成功，改用 -force"
-              hdiutil detach "/Volumes/Coast" -force || true
-              sleep 2
-            fi
-            if ! hdiutil convert "$RW" -format UDZO -o "$DMG" -ov; then
-              # 只有一行 "convert failed" 看不出是谁占着卷 —— 把挂载情况打出来。
-              echo "::warning::hdiutil convert 失败，当前挂载情况："
-              hdiutil info || true
-              return 1
-            fi
-            rm -f "$RW"
-            [ -f "$DMG" ] || return 1
-          }
-          rm -f "$DMG"
-          if ! ( layout_dmg ); then
-            # Finder 脚本在 runner 上偶发起不来（无登录会话 / AppleEvent 超时），
-            # 不该让整条腿红掉 —— 回退朴素 dmg。hdiutil 自己也偶发 "resource busy"，重试几次。
-            echo "::warning::自定义 dmg 布局失败 —— 回退朴素 dmg"
-            rm -f "$DMG"
-            for attempt in 1 2 3 4; do
-              hdiutil detach "/Volumes/Coast" -force >/dev/null 2>&1 || true
-              hdiutil create -volname "Coast" -srcfolder "$DMGSTAGE" -ov -format UDZO "$DMG" && break
-              echo "hdiutil create 失败（第 $attempt/4 次），8 秒后重试"; sleep 8
-            done
-          fi
-          [ -f "$DMG" ] || { echo "ERROR: dmg 没生成"; exit 1; }
+          # ★ 布局 + 兜底整段收在 clashauto-c++/scripts/make_dmg.sh 里，**四个使用方共用一份**：
+          #   本仓库的 macos / macos-swift 两个 job，以及 integemjack/schat.build 的
+          #   clashauto-mac-qt.yml / clashauto-mac.yml（后两者才是用户拿到的签名包，
+          #   而它们检出的就是本仓库的源码，所以直接调这个文件即可）。
+          #   2026-08-12 对账发现那两份还停在 2026-08-10 那次事故之前的写法：函数体里写
+          #   `set -e` 就以为够了，一处 `|| return 1` 都没有 —— 而 `set -e` 对被当作条件
+          #   求值的命令是失效的，于是 convert 失败时函数照样返回 0、兜底根本不触发，
+          #   release 静默少一个平台的包。收敛成一份之后这种漂移在结构上不再可能。
+          # ⚠️ 用 $GITHUB_WORKSPACE 而不是相对路径：macos-swift 那一步带着
+          #    `working-directory: macos`，相对路径在那里解析不到 —— 表现是 exit 127
+          #    （command not found），而 127 看着像"脚本内部出错"，其实是根本没找到脚本。
+          bash "$GITHUB_WORKSPACE/clashauto-c++/scripts/make_dmg.sh" "$DMGSTAGE" "$DMG" Coast Coast.app
 
           # 公证 + 装订。**只在真签且有公证凭据时做**；一旦开做就必须成功 ——
           # 政策是「release 里绝不放未公证的包」，所以这里失败即整步失败、artifact 不上传，
