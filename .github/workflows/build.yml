@@ -461,7 +461,25 @@ jobs:
           $tmp = Join-Path $env:RUNNER_TEMP "core-bundle"
           New-Item -ItemType Directory -Force $tmp | Out-Null
           # 下载直链不带 Authorization：它 302 到对象存储，多带一层凭据可能被拒
-          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$tmp\core.zip"
+          # ★ 必须重试。这是**单点**：内核 zip 下不来 = 这个平台的包整个不进 release，
+          #   而 release 本身照样建出来 —— 用户看到新版本、点下去没有他那个架构的包。
+          #   2026-08-12 实测就这么丢过一次 windows-arm64：资产已经找到
+          #   （coast-windows-arm64-v1.10.4425.zip），下载时 GitHub 的 CDN 回了
+          #   `503 Service Unavailable No server is available to handle this request.`，
+          #   一次就把整条腿判死。这是瞬时故障，重试一下就过去了。
+          #   （同一个理由下，trigger-mac 推 schat.build 那一步早就有 5 次重试。）
+          $ok = $false
+          foreach ($attempt in 1..5) {
+            try {
+              Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$tmp\core.zip"
+              $ok = $true
+              break
+            } catch {
+              Write-Host "::warning::下载内核第 $attempt 次失败：$($_.Exception.Message)"
+              if ($attempt -lt 5) { Start-Sleep -Seconds (3 * $attempt) }
+            }
+          }
+          if (-not $ok) { throw "内核 zip 连续 5 次下载失败，本平台的包会缺席 release" }
           Expand-Archive -Path "$tmp\core.zip" -DestinationPath "$tmp\x" -Force
           $exe = Get-ChildItem "$tmp\x" -Recurse -Filter *.exe | Select-Object -First 1
           if (-not $exe) { throw "内核 zip 里没有 exe" }
