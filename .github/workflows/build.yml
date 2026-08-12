@@ -470,17 +470,22 @@ jobs:
           #   一次就把整条腿判死。这是瞬时故障，重试一下就过去了。
           #   （同一个理由下，trigger-mac 推 schat.build 那一步早就有 5 次重试。）
           $ok = $false
-          foreach ($attempt in 1..5) {
+          foreach ($attempt in 1..8) {
             try {
               Invoke-WebRequest -Uri $asset.browser_download_url -OutFile "$tmp\core.zip"
               $ok = $true
               break
             } catch {
               Write-Host "::warning::下载内核第 $attempt 次失败：$($_.Exception.Message)"
-              if ($attempt -lt 5) { Start-Sleep -Seconds (3 * $attempt) }
+              # 退避与 scripts/fetch_core.sh 保持同一档，两边必须一起改。
+              # ★ 原来是 5 次 × (3·n) 秒 = 总窗口才 30 秒，太短：2026-08-12 的 run 201 里
+              #   GitHub 资源 CDN 连着 503 了 32 秒，五次全打在这个窗口内，windows-arm64
+              #   当场红掉、那一版就少了一个平台的包。同一轮 Linux 两条腿都活下来了 ——
+              #   只因为那边的窗口更宽。判据不该是「重试几次」而是「总共熬多久」。
+              if ($attempt -lt 8) { Start-Sleep -Seconds ([Math]::Min(5 * $attempt, 20)) }
             }
           }
-          if (-not $ok) { throw "内核 zip 连续 5 次下载失败，本平台的包会缺席 release" }
+          if (-not $ok) { throw "内核 zip 连续 8 次下载失败，本平台的包会缺席 release" }
           Expand-Archive -Path "$tmp\core.zip" -DestinationPath "$tmp\x" -Force
           $exe = Get-ChildItem "$tmp\x" -Recurse -Filter *.exe | Select-Object -First 1
           if (-not $exe) { throw "内核 zip 里没有 exe" }
