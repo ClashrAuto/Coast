@@ -2118,6 +2118,11 @@ jobs:
           }
           # ★ CONTROLSERVER 那条**不能**在设了 COAST_CONTROL_ALLOW_POLICY 的环境里跑：
           #   那个逃生门会把策略级直接放行，于是「门禁挡住了没有」的断言永远通不过。
+          # ★★ 这份名单里只许出现 **Swift 侧真的注册过**的钩子。列进一个 Qt 独有的
+          #   （比如 COAST_LOGROUTE_SELFTEST：qWarning 进日志页，Swift 没有对应实现），
+          #   后果不是"少跑一个"，而是 run_hook 判它 exit=2「没有任何 if 认领它」→
+          #   **整条 macos-swift 腿必然红**。2026-08-12 实测栽过。
+          #   现在由 scripts/selftest_ci_lists_check.py 守着，别再手工核对。
           for t in COAST_CONTROLAPI_SELFTEST COAST_CONTROLSERVER_SELFTEST \
                    COAST_MCP_SELFTEST COAST_CONFIRM_SELFTEST \
                    COAST_RULEEXPLAIN_SELFTEST COAST_CHANGELOG_SELFTEST \
@@ -2125,7 +2130,6 @@ jobs:
                    COAST_CONFIGVALIDATE_SELFTEST \
                    COAST_SETTINGS_SELFTEST COAST_SUBS_SELFTEST \
                    COAST_CONNSTATS_SELFTEST COAST_HISTORY_SELFTEST \
-                   COAST_LOGROUTE_SELFTEST \
                    COAST_COREPICK_SELFTEST COAST_SUBPARSER_SELFTEST \
                    COAST_YAMLNAME_SELFTEST; do
             run_hook "$t"
