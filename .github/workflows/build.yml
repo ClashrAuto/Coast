@@ -2205,6 +2205,40 @@ jobs:
           test -x Coast.app/Contents/Resources/core
           echo "bundle 结构 OK"
 
+      # ★★ 让**真核心**判一次我们生成的 full.yaml。
+      #
+      #   本仓库自己写着：「改动涉及配置生成时，最要紧的一条检查就是让核心自己判 YAML」——
+      #   因为这里的 YAML 全是手拼字符串，编译期没有任何信号，而核心不接受时的后果不是
+      #   「某个功能没生效」，是**整份配置被拒、代理根本起不来**。
+      #   `RealCoreValidationTests` / `RealCoreE2ETests` 早就写好了，却挂在
+      #   `COAST_TEST_MIHOMO` 这个 opt-in 上 —— **CI 从来没设过它，所以一次都没跑过**。
+      #   而核心此刻就躺在刚打好的包里（上一步刚断言过 `-x`），白放着不用。
+      #
+      #   ⚠️ **只跑 `--filter RealCore`，不要给整个 `swift test` 设这个变量**：
+      #   `scripts/regression.sh` 里写明了原因 —— 真核心一开，`controllerNoticesCrash`
+      #   会挂住不返回。CI 里挂住比红灯糟得多（要烧到 6 小时上限）。
+      #   实测（真 Mac + v1.10.4425）：这一组 10 个用例 9.4 秒跑完，含
+      #   「真核心接受我们生成的 full.yaml（TUN 开/关）」两条 —— 而那两条正是
+      #   订阅解析 → proxies 块这条路唯一的权威判据（它们喂给核心的就是
+      #   `SubParser.toClashProxies` 的产物）。
+      - name: Real-core validation of generated config
+        working-directory: macos
+        run: |
+          set -uo pipefail
+          # 路径与上一步 “Verify bundle” 完全一致（同一个 working-directory: macos）。
+          CORE="$PWD/Coast.app/Contents/Resources/core"
+          if [ ! -x "$CORE" ]; then
+            echo "::error::找不到刚打包进去的核心，真核心校验没跑成 —— 这一步的全部价值就在于它真的跑了"
+            exit 1
+          fi
+          "$CORE" -v | head -1
+          COAST_TEST_MIHOMO="$CORE" swift test --filter RealCore 2>&1 | tail -25
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" != 0 ]; then
+            echo "::error::真核心拒绝了我们生成的配置（或 REST 端到端没通）—— 见上面的输出"
+            exit 1
+          fi
+
       - name: Package .zip / .dmg + notarize
         working-directory: macos
         env:
