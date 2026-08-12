@@ -1529,6 +1529,30 @@ jobs:
           fi
           echo "核心判定：合法"
 
+          # ★★ 上面验的是「这份**生成的配置**核心认不认」。这里验的是另一件事：
+          #    **`ConfigValidator` 自己还认不认得出一份坏配置**。
+          #
+          #    它是 `withCoreValidation` 的地基 —— AI 改完配置由它复核，判不过就撤回并把核心
+          #    原话带给模型。它一旦静默失效（比如上游把 `test failed` 那句话换了个说法），
+          #    表现是**每一次复核都通过**：坏规则照样落盘，模型收到「成功」，而核心下次
+          #    拒绝加载整份配置 —— 不是「某个功能没生效」，是代理整个停摆。
+          #
+          #    这半边此前**在任何地方都没跑过**：CI 的 runner 上没有内核，所以钩子只能走
+          #    fail-open 那条路（CLAUDE.md 里写着「『坏配置能被判出来』那半边要有内核才验得了」）。
+          #    而此刻内核就在 $STAGE_DIR/core —— 上一步刚用它判过配置。
+          #    钩子认 `COAST_TEST_CORE`，指过去即可。
+          #    2026-08-13 在真 Linux 上拿出货的包验过：坏配置「跑成了/判为不合法/带得出核心
+          #    原话」三条全绿，好配置判为合法，rc=0。
+          echo "── ConfigValidator 自检（带真内核，验的是「坏配置能不能被判出来」）──"
+          vout="$(timeout 90 env QT_QPA_PLATFORM=offscreen \
+                    COAST_TEST_CORE="$STAGE_DIR/core" \
+                    COAST_CONFIGVALIDATE_SELFTEST=1 "$BUILD_DIR/coast" 2>&1)"; vrc=$?
+          printf '%s\n' "$vout" | sed 's/^/    /'
+          if [ "$vrc" != 0 ]; then
+            echo "::error::COAST_CONFIGVALIDATE_SELFTEST 带真内核时失败（exit=$vrc）—— 复核这条路已经不可信了，AI 改配置将失去唯一的兜底"
+            exit 1
+          fi
+
       - name: Create portable tar.gz
         shell: bash
         run: |
