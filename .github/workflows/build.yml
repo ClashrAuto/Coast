@@ -365,7 +365,8 @@ jobs:
                            'COAST_MCP_SELFTEST', 'COAST_CONFIGVALIDATE_SELFTEST',
                            'COAST_CONFIRM_SELFTEST', 'COAST_RULEEXPLAIN_SELFTEST',
                            'COAST_CHANGELOG_SELFTEST', 'COAST_NODEHEALTH_SELFTEST',
-                           'COAST_SCHEDULE_SELFTEST', 'COAST_SINGLEINSTANCE_SELFTEST')) {
+                           'COAST_SCHEDULE_SELFTEST', 'COAST_SINGLEINSTANCE_SELFTEST',
+                           'COAST_ARPWATCH_SELFTEST')) {
             Set-Item "Env:\$t" '1'
             $out = Join-Path $env:RUNNER_TEMP "$t.out"
             # ★★ 用 WaitForExit(30000) 而不是 -Wait：钩子一旦没被注册（比如被裹进某个平台
@@ -930,7 +931,7 @@ jobs:
                    COAST_MCP_SELFTEST COAST_CONFIGVALIDATE_SELFTEST \
                    COAST_CONFIRM_SELFTEST COAST_RULEEXPLAIN_SELFTEST \
                    COAST_CHANGELOG_SELFTEST COAST_NODEHEALTH_SELFTEST \
-                   COAST_SCHEDULE_SELFTEST COAST_SINGLEINSTANCE_SELFTEST; do
+                   COAST_SCHEDULE_SELFTEST COAST_SINGLEINSTANCE_SELFTEST \n                   COAST_ARPWATCH_SELFTEST; do
             run_hook "$t"
           done
 
@@ -1354,6 +1355,9 @@ jobs:
           run_selftest COAST_SCHEDULE_SELFTEST
           # 单实例裁决：两个实例并存会互相清掉网关的 nft/pf 规则（见 SingleInstance.h）。
           run_selftest COAST_SINGLEINSTANCE_SELFTEST
+          # 冒充监测去抖表的上界：它的键含**攻击者可控**的 MAC，没上界时局域网里的人
+          # 用随机 MAC 就能把网关拖死 —— 而这本是检测攻击的组件。
+          run_selftest COAST_ARPWATCH_SELFTEST
           # ↓ core -t 复核。runner 上没有内核，所以这里验到的是 **fail-open 那条路**：
           #   判不了时必须 ran=false 且给得出原因，而不是悄悄 ok=true（那样用户会以为
           #   有核心把关，其实一次都没跑过）。"坏配置能被判出来"那半边要有内核才验得了，
