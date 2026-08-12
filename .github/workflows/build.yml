@@ -953,33 +953,8 @@ jobs:
           # 落到 Contents/Resources/core，首次运行由 CoreController::seedBundledCore() 落位到
           # userDir/command/core（缺了才补，绝不覆盖）。
           # ★ 这一步是**在签名之前**跑的：往已签名的 .app 里塞文件会当场破坏封存。
-          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
-            'https://api.github.com/repos/ClashrAuto/clash/releases?per_page=20' -o /tmp/core-releases.json
-          pick() {  # 参数 = 产物名前缀（按优先级），打印下载直链
-            python3 - /tmp/core-releases.json "$@" <<'PY'
-          import json, sys
-          releases = json.load(open(sys.argv[1]))
-          for release in releases:
-              if release.get("draft") or release.get("prerelease"):
-                  continue
-              for prefix in sys.argv[2:]:
-                  for asset in release.get("assets", []):
-                      name = asset.get("name", "")
-                      if name.startswith(prefix) and name.endswith(".gz"):
-                          print(asset["browser_download_url"])
-                          sys.exit(0)
-          sys.exit(1)
-          PY
-          }
-          fetch() {  # $1 = 输出文件，其余 = 前缀
-            local out="$1"; shift
-            local url
-            url="$(pick "$@")" || { echo "正式版通道里没有 $* 产物" >&2; return 1; }
-            echo "集成内核: $(basename "$url")"
-            # 下载直链不带 Authorization：它 302 到对象存储，多带一层凭据可能被拒
-            curl -fsSL --retry 3 "$url" | gunzip > "$out"
-            test -s "$out"
-          }
+          # 挑选 + 下载 + 解压收在 scripts/fetch_core.sh 里（三条腿共用一份，理由见那里）。
+          fetch() { bash clashauto-c++/scripts/fetch_core.sh "$@"; }
           # amd64 优先 -compatible（v1 基线）：普通 amd64 产物是 GOAMD64=v3，老 Intel 机
           # 直接非法指令崩 —— 与 CoreRelease.h / make_app.sh 的挑选顺序一字不差。
           fetch /tmp/core-arm64 "coast-darwin-arm64-"
@@ -1471,27 +1446,11 @@ jobs:
           # 才补，绝不覆盖）。挑选规则与应用内 CoreRelease.h 一字不差：/releases 全量列表
           # （latest 会落到 fork 从上游继承的零资产空 tag 上）、跳过 draft/prerelease。
           # 下载失败**打包当场失败**——默认集成的包缺内核是静默劣化。
-          curl -fsSL --retry 3 -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' \
-            'https://api.github.com/repos/ClashrAuto/clash/releases?per_page=20' -o /tmp/core-releases.json
-          url="$(python3 - /tmp/core-releases.json <<'PY'
-          import json, os, sys
-          releases = json.load(open(sys.argv[1]))
-          for release in releases:
-              if release.get("draft") or release.get("prerelease"):
-                  continue
-              for prefix in os.environ["CORE_PREFIXES"].split(","):
-                  for asset in release.get("assets", []):
-                      name = asset.get("name", "")
-                      if name.startswith(prefix) and name.endswith(".gz"):
-                          print(asset["browser_download_url"])
-                          sys.exit(0)
-          sys.exit(1)
-          PY
-          )" || { echo "正式版通道里没有 $CORE_PREFIXES 产物" >&2; exit 1; }
-          echo "集成内核: $(basename "$url")"
-          # 下载直链不带 Authorization：它 302 到对象存储，多带一层凭据可能被拒
-          curl -fsSL --retry 3 "$url" | gunzip > "$STAGE_DIR/core"
-          test -s "$STAGE_DIR/core"
+          # 挑选 + 下载 + 解压收在 scripts/fetch_core.sh 里（三条腿共用一份，见那里的说明：
+          # 原来三处各写一遍 `curl --retry | gunzip`，而 --retry 是从头重传、管道里的字节
+          # 已经被 gunzip 吃掉了）。
+          IFS=, read -r -a prefixes <<< "$CORE_PREFIXES"
+          bash clashauto-c++/scripts/fetch_core.sh "$STAGE_DIR/core" "${prefixes[@]}"
           chmod 755 "$STAGE_DIR/core"
           # ★ 真的把集成内核跑一下，并把它自报的版本打进日志。
           #
