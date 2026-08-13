@@ -1371,6 +1371,9 @@ jobs:
           run_selftest COAST_DEVICEDB_SELFTEST     # 设备台账
           run_selftest COAST_CONNSTATS_SELFTEST    # 连接分桶统计
           run_selftest COAST_LOGROUTE_SELFTEST     # qWarning 能不能进日志页
+          # 「开机自启」落地文件的内容与读写。**在 Linux 上跑最要紧**：这条腿正是新实现的
+          # XDG 那一份；顺带也验 macOS 的 plist（内容是纯函数，任何平台都算得出来）。
+          run_selftest COAST_AUTOSTART_SELFTEST    # 开机自启文件
 
           # ★ TPROXY **规则层**（不是数据面）：装 nft + 策略路由 → 核对 → 增删设备 → 拆 →
           #   核对拆干净。以前因为「要 root」被排除在外，而 2026-08-11 在真 Linux 上跑过之后
