@@ -1362,6 +1362,7 @@ jobs:
           # 配置解析：取值函数本身（引号里的 # 不能当注释截断 —— use_rule 的 allow/noallow
           # 是用户手写的节点过滤正则，截断之后过滤到的是另一批节点）。纯字符串处理，不碰文件。
           run_selftest COAST_CONFIGPARSE_SELFTEST  # config.yaml 标量取值
+          run_selftest COAST_MMDB_SELFTEST         # 畸形 GeoIP 库只能判失败，不能把校验器带走
           # 订阅 YAML 标量往返：节点的身份键里就有名字（server:port + name），
           # 读错了增量更新会认错人 —— 用户做过的启用/禁用全部错位。
           run_selftest COAST_SUBYAML_SELFTEST      # subscribe.yaml 标量往返
