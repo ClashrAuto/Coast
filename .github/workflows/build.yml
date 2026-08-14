@@ -360,6 +360,7 @@ jobs:
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
                            'COAST_TCPREAP_SELFTEST', 'COAST_TIDE_SELFTEST',
+                           'COAST_SEEDMIGRATE_SELFTEST',
                            'COAST_BUNDLEDCORE_SELFTEST',
                            'COAST_CONTROLAPI_SELFTEST', 'COAST_CONTROLSERVER_SELFTEST',
                            'COAST_MCP_SELFTEST', 'COAST_CONFIGVALIDATE_SELFTEST',
@@ -1311,6 +1312,10 @@ jobs:
           run_selftest COAST_ARPPARSE_SELFTEST
           run_selftest COAST_NICEGRESS_SELFTEST
           run_selftest COAST_TIDE_SELFTEST
+          # 老模板迁移：它动的是**用户已经存在的**配置与台账。搬错一条 = 用户自己加的规则没了；
+          # 漏改一处组名 = 规则指向不存在的组，核心拒绝**整份配置**，所有人的代理都起不来。
+          # 纯逻辑 + 临时目录，秒级、无网络无台账。
+          run_selftest COAST_SEEDMIGRATE_SELFTEST
           run_selftest COAST_BUNDLEDCORE_SELFTEST
           # ↓ 这三条以前在 Linux 上**根本跑不了**：它们被误裹在 #ifdef COAST_HAVE_RUST_STACK
           #   里，而那个宏只在 Windows+COAST_RUST 时定义。分流判定（RuleEngine）是三端共用的
@@ -1363,6 +1368,11 @@ jobs:
           # 是用户手写的节点过滤正则，截断之后过滤到的是另一批节点）。纯字符串处理，不碰文件。
           run_selftest COAST_CONFIGPARSE_SELFTEST  # config.yaml 标量取值
           run_selftest COAST_MMDB_SELFTEST         # 畸形 GeoIP 库只能判失败，不能把校验器带走
+          # ★ 一键更新挑哪个包：安装版必须下 setup.exe（/S 原地升级，卸载入口与快捷方式随之
+          #   维护），便携版必须下 portable zip。挑反了两个方向都**不报错**：安装版被便携包
+          #   盖掉（注册表版本号不动、图标丢了回不来），或便携版被就地装成安装版（凭空多出
+          #   快捷方式与卸载入口，不可逆）。逻辑是纯函数，Linux 这条腿就能跑。
+          run_selftest COAST_UPDATEPICK_SELFTEST   # 更新包挑选（安装版 vs 便携版）
           # 订阅 YAML 标量往返：节点的身份键里就有名字（server:port + name），
           # 读错了增量更新会认错人 —— 用户做过的启用/禁用全部错位。
           run_selftest COAST_SUBYAML_SELFTEST      # subscribe.yaml 标量往返
@@ -2138,6 +2148,11 @@ jobs:
           #   后果不是"少跑一个"，而是 run_hook 判它 exit=2「没有任何 if 认领它」→
           #   **整条 macos-swift 腿必然红**。2026-08-12 实测栽过。
           #   现在由 scripts/selftest_ci_lists_check.py 守着，别再手工核对。
+          # ⚠️ COAST_SEEDMIGRATE_SELFTEST 就是这么进来又被摘掉的：老模板迁移那一轮
+          #   （2026-08-13）把它加进了这份名单，但 Swift 侧只实现了迁移本身
+          #   （ConfigBuilder.migrateLegacySeedIfNeeded），**没有注册这个钩子** ——
+          #   于是这条腿从那天起就必然红。摘掉是为了让名单说实话；Swift 那侧的迁移
+          #   至今没有任何自检，值得补，但那是另一件事，别再往这份名单里先写着占位。
           for t in COAST_CONTROLAPI_SELFTEST COAST_CONTROLSERVER_SELFTEST \
                    COAST_MCP_SELFTEST COAST_CONFIRM_SELFTEST \
                    COAST_RULEEXPLAIN_SELFTEST COAST_CHANGELOG_SELFTEST \
