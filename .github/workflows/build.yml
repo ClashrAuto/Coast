@@ -2148,11 +2148,11 @@ jobs:
           #   后果不是"少跑一个"，而是 run_hook 判它 exit=2「没有任何 if 认领它」→
           #   **整条 macos-swift 腿必然红**。2026-08-12 实测栽过。
           #   现在由 scripts/selftest_ci_lists_check.py 守着，别再手工核对。
-          # ⚠️ COAST_SEEDMIGRATE_SELFTEST 就是这么进来又被摘掉的：老模板迁移那一轮
-          #   （2026-08-13）把它加进了这份名单，但 Swift 侧只实现了迁移本身
-          #   （ConfigBuilder.migrateLegacySeedIfNeeded），**没有注册这个钩子** ——
-          #   于是这条腿从那天起就必然红。摘掉是为了让名单说实话；Swift 那侧的迁移
-          #   至今没有任何自检，值得补，但那是另一件事，别再往这份名单里先写着占位。
+          # ⚠️ COAST_SEEDMIGRATE_SELFTEST 曾经在这份名单里空转过两轮发布：老模板迁移那一轮
+          #   （2026-08-13）把名字加了进来，但 Swift 侧只实现了迁移本身、**没有注册钩子** ——
+          #   run_hook 判 exit=2「没有任何 if 认领它」，这条腿从那天起必然红。
+          #   2026-08-15 把钩子真正实现了（SelfTests.seedMigrateSelfTest），才重新列回来。
+          #   教训就是这份注释开头那句：名单里只许出现**真的注册过**的钩子，别先占位。
           for t in COAST_CONTROLAPI_SELFTEST COAST_CONTROLSERVER_SELFTEST \
                    COAST_MCP_SELFTEST COAST_CONFIRM_SELFTEST \
                    COAST_RULEEXPLAIN_SELFTEST COAST_CHANGELOG_SELFTEST \
@@ -2161,7 +2161,7 @@ jobs:
                    COAST_SETTINGS_SELFTEST COAST_SUBS_SELFTEST \
                    COAST_CONNSTATS_SELFTEST COAST_HISTORY_SELFTEST \
                    COAST_COREPICK_SELFTEST COAST_SUBPARSER_SELFTEST \
-                   COAST_YAMLNAME_SELFTEST \
+                   COAST_YAMLNAME_SELFTEST COAST_SEEDMIGRATE_SELFTEST \
                    COAST_PATHS_SELFTEST; do
             run_hook "$t"
           done
