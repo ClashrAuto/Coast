@@ -362,6 +362,7 @@ jobs:
                            'COAST_TCPREAP_SELFTEST', 'COAST_TIDE_SELFTEST',
                            'COAST_SEEDMIGRATE_SELFTEST',
                            'COAST_BUNDLEDCORE_SELFTEST',
+                           'COAST_RULETOGGLE_SELFTEST',
                            'COAST_CONTROLAPI_SELFTEST', 'COAST_CONTROLSERVER_SELFTEST',
                            'COAST_MCP_SELFTEST', 'COAST_CONFIGVALIDATE_SELFTEST',
                            'COAST_CONFIRM_SELFTEST', 'COAST_RULEEXPLAIN_SELFTEST',
@@ -1317,6 +1318,10 @@ jobs:
           # 纯逻辑 + 临时目录，秒级、无网络无台账。
           run_selftest COAST_SEEDMIGRATE_SELFTEST
           run_selftest COAST_BUNDLEDCORE_SELFTEST
+          # 规则页那颗开关的往返（停用 = 那一行在 default.yaml 里变注释、留在原位）。
+          # 三种写错法全部零报错，见 SettingsController::runRuleToggleSelfTest 上面那段。
+          # 自己在 COAST_DATA_DIR 沙箱里跑，秒级、无网络。
+          run_selftest COAST_RULETOGGLE_SELFTEST
           # ↓ 这三条以前在 Linux 上**根本跑不了**：它们被误裹在 #ifdef COAST_HAVE_RUST_STACK
           #   里，而那个宏只在 Windows+COAST_RUST 时定义。分流判定（RuleEngine）是三端共用的
           #   唯一实现，加密 KAT 也一样，却只有 Windows 那条腿能验 —— 现在补上。
