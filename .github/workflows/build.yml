@@ -1813,33 +1813,56 @@ jobs:
           EXPECT_SHA256: 4b2679456c355569552e4d6c7b897e5f7fc3ef97060c7da90f36c79bc05d2495
         run: |
           set -euo pipefail
-          apk=android/app/build/outputs/apk/release/app-release.apk
-          # ★ 缺签名配置时 AGP 会产出 `app-release-unsigned.apk` 并**照常成功**。
-          #   所以第一判据是「那个不带 -unsigned 的文件在不在」，第二判据才是指纹。
-          if [ ! -f "$apk" ]; then
-            ls -la android/app/build/outputs/apk/release/ || true
-            echo "::error::没有 app-release.apk —— 多半是签名材料缺失、产出了 -unsigned 包"
-            exit 1
-          fi
+          dir=android/app/build/outputs/apk/release
+          # ★ 按 ABI 拆包之后产物是 `app-<abi>-release.apk` 四个，**没有** `app-release.apk`。
+          #   这里逐个验，而不是只验一个 —— 只验 universal 的话，某一份没签上不会被发现，
+          #   而那一份恰恰是大多数用户会下的那个（arm64）。
+          # ★ 缺签名配置时 AGP 会产出 `*-unsigned.apk` 并**照常成功**。
+          #   所以第一判据是「有几个不带 -unsigned 的文件」，第二判据才是指纹。
+          # ⚠️ **不要用数组收集再展开。** 这一步是 `set -euo pipefail`，而在 bash 4.3 及更早
+          #   （macOS 自带的是 3.2）对**空数组**做 `"${arr[@]}"` 会直接 `unbound variable`
+          #   报错退出 —— 于是"一个都没产出"这种最该被清楚报出来的情况，
+          #   变成一句与被测对象无关的 bash 错误。这里改成按固定名字逐个查。
           signer="$(ls -d "$ANDROID_HOME"/build-tools/*/ | sort -V | tail -1)apksigner"
-          out="$("$signer" verify --print-certs "$apk")"
-          echo "$out"
-          got="$(printf '%s\n' "$out" | sed -nE 's/.*certificate SHA-256 digest: ([0-9a-f]+).*/\1/p' | head -1)"
-          if [ "$got" != "$EXPECT_SHA256" ]; then
-            echo "::error::签名指纹对不上：得到 [$got]，期望 [$EXPECT_SHA256]"
+          missing=0
+          for abi in arm64-v8a armeabi-v7a x86_64 universal; do
+            apk="$dir/app-$abi-release.apk"
+            if [ ! -f "$apk" ]; then
+              echo "::error::缺 $(basename "$apk") —— 多半是签名材料缺失、产出了 -unsigned 包"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            ls -la "$dir" || true
             exit 1
           fi
-          echo "签名指纹与 certs/README.md 一致：$got"
+          for abi in arm64-v8a armeabi-v7a x86_64 universal; do
+            apk="$dir/app-$abi-release.apk"
+            out="$("$signer" verify --print-certs "$apk")"
+            got="$(printf '%s\n' "$out" | sed -nE 's/.*certificate SHA-256 digest: ([0-9a-f]+).*/\1/p' | head -1)"
+            if [ "$got" != "$EXPECT_SHA256" ]; then
+              echo "::error::$(basename "$apk") 签名指纹对不上：得到 [$got]，期望 [$EXPECT_SHA256]"
+              exit 1
+            fi
+            echo "$(basename "$apk") 签名指纹一致：$got"
+          done
 
       - name: Stage release artifacts
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          out="dist/Coast-${APP_VERSION}-android-universal.apk"
-          cp android/app/build/outputs/apk/release/app-release.apk "$out"
-          # 与其余平台同一个约定：每个发布物配一个 <文件>.sha256（仅摘要）
-          sha256sum "$out" | awk '{print $1}' > "$out.sha256"
+          dir=android/app/build/outputs/apk/release
+          # ★ 四个都发：绝大多数手机要 arm64-v8a（约 35 MB），universal 留给
+          #   "不确定自己该拿哪个"的人（就是拆分之前的那个包）。
+          for abi in arm64-v8a armeabi-v7a x86_64 universal; do
+            src="$dir/app-$abi-release.apk"
+            [ -f "$src" ] || { echo "::error::缺 $src"; exit 1; }
+            out="dist/Coast-${APP_VERSION}-android-$abi.apk"
+            cp "$src" "$out"
+            # 与其余平台同一个约定：每个发布物配一个 <文件>.sha256（仅摘要）
+            sha256sum "$out" | awk '{print $1}' > "$out.sha256"
+          done
           ls -l dist/
 
       - name: Upload workflow artifacts
