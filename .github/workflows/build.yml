@@ -2367,7 +2367,8 @@ jobs:
                    COAST_CONNSTATS_SELFTEST COAST_HISTORY_SELFTEST \
                    COAST_COREPICK_SELFTEST COAST_SUBPARSER_SELFTEST \
                    COAST_YAMLNAME_SELFTEST COAST_SEEDMIGRATE_SELFTEST \
-                   COAST_PATHS_SELFTEST COAST_PUBADDR_SELFTEST; do
+                   COAST_PATHS_SELFTEST COAST_PUBADDR_SELFTEST \
+                   COAST_REMOTE_SELFTEST; do
             run_hook "$t"
           done
           # ★ 后面这四条 2026-08-11 才补，之前 Swift 线**两处都没跑过**。
