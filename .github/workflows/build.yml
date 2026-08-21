@@ -365,6 +365,7 @@ jobs:
           #   策略级放行，"门禁挡住了没有"的断言就永远通不过）。CI 本就不设它。
           foreach ($t in @('COAST_STATICDEPS_SELFTEST',
                            'COAST_ARPPARSE_SELFTEST', 'COAST_NICEGRESS_SELFTEST',
+                           'COAST_PUBADDR_SELFTEST',
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
                            'COAST_TCPREAP_SELFTEST', 'COAST_TIDE_SELFTEST',
@@ -1320,6 +1321,12 @@ jobs:
           run_selftest COAST_STATICDEPS_SELFTEST
           run_selftest COAST_ARPPARSE_SELFTEST
           run_selftest COAST_NICEGRESS_SELFTEST
+          # 公网 IPv6 选址（远程接入）。干净 runner 上没有公网 IPv6，那时它判 SKIP 而非 FAIL
+          # —— 判失败会让这条钩子变成环境探针，那种恒红的门禁最后一定被加白名单绕过。
+          # 这里真正验的是 Linux 那份实现能跑通：它读 /proc/net/if_inet6，
+          # 而 procfs 的 st_size 是 0，QFile::atEnd() 打开即为真——用 readLine 循环
+          # 会一行都读不到，失败形态与「真的没有地址」完全无法区分。
+          run_selftest COAST_PUBADDR_SELFTEST
           run_selftest COAST_TIDE_SELFTEST
           # 老模板迁移：它动的是**用户已经存在的**配置与台账。搬错一条 = 用户自己加的规则没了；
           # 漏改一处组名 = 规则指向不存在的组，核心拒绝**整份配置**，所有人的代理都起不来。
