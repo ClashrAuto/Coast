@@ -30,25 +30,33 @@ on:
 permissions:
   contents: write
 
-# 同一个功能分支连着推几次时，只留最新那次在跑，把前面几次取消掉。
+# 同一个功能分支连着推几次时：**在跑的让它跑完，排队的只留最新一个**。
 #
-# ★ 为什么需要：所有分支都构建，而这套构建里静态 Qt 那几个 job 动辄几十分钟。
+# ★ 为什么需要并发控制：所有分支都构建，而这套构建里静态 Qt 那几个 job 动辄几十分钟。
 #   在一个分支上连推四五次 = 四五个整轮（每轮 7 个 job）同时挤在 runner 池里，
 #   越早推的越先占位，于是**最新那次要等最久**——「推上去、等包、下载验证」这条
 #   基本流程直接变成几小时一轮。2026-08-08 实测堵到 6 个 run × 7 job 同时排队。
 #
-# ★ master/main **绝不取消**：那里每一个提交都是一次正式发布（版本号 = 提交计数），
-#   取消掉就等于那个版本永远没发出来。做法是给主分支的每个 run 一个**独一无二**的
-#   分组键（run_id），于是它永远不会和任何人同组 —— 既不取消别人，也不排队等别人。
-#   其余分支按 ref 共享一个组，新的把旧的顶掉。
-#   被取消的 beta 只会留下一个资产不全的预发布，而它的 tag 里带着自己的 sha7、
-#   与下一轮互不相干；客户端对这种包是「挑不到自己平台的资产 → 判无更新」，不会装错。
+# ★★ 为什么是**排队**而不是取消在跑的（此处原来是 `cancel-in-progress: true`，
+#   2026-08-21 改掉，代价是真金白银换来的）：
+#   `manifest` job `needs` 全部平台、排在整轮最末，取消永远先砍到它 ——
+#   于是**资产传完了、清单没刷**。当天实测：v1.0.1685/1686/1687 三个 beta 都已发布，
+#   `version.json` 停在 1684 整整 50 分钟，三条客户端线的「检查更新」都看不见新版；
+#   要不是恰好又推了一次文档提交、让最后一轮跑完自愈，它会**无限期**停在旧版 ——
+#   而这零报错，表现就是用户说的「检查更新获取不到新版本」。
+#   排队的语义（GitHub 原生）：在跑的完整跑完（清单必然落地）；pending 里只留最新一个，
+#   中间那些推送**连 run 都不开**——不再产生资产不全的残缺 beta，反而更干净。
+#   ⚠️ 副作用要知道：一轮卡死会把队伍堵到它 6 小时超时为止 —— 罕见，可接受。
+#
+# ★ master/main 仍然**互不排队也绝不取消**：那里每一个提交都是一次正式发布
+#   （版本号 = 提交计数），做法不变 —— 给主分支的每个 run 一个**独一无二**的
+#   分组键（run_id），永远不和任何人同组。
 concurrency:
   group: >-
     coast-build-${{ (github.event.inputs.ref || github.event.client_payload.ref || 'master') }}-${{
       ((github.event.inputs.ref || github.event.client_payload.ref || 'master') == 'master' || (github.event.inputs.ref || github.event.client_payload.ref || 'master') == 'main') && github.run_id || 'shared'
     }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   # ★ 构建对象。workflow_dispatch 用输入，repository_dispatch 用 client_payload，
@@ -2262,6 +2270,27 @@ jobs:
           grep -E '✘|error:|[Ff]ailed' /tmp/swift-test.log \
             | head -20 \
             | sed 's/^/::error::swift test: /' || true
+          exit 1
+
+      # ★★ **iOS 线的 `CoastCore` 也在这条腿上跑** —— 它在此之前**一条测试都没进门禁**：
+      #   `ci.yml` 里 iOS 只有两道 Python 源码门禁（audit_1to1 / project_check），
+      #   而 `ios/CoastCore` 的两百多条单元测试只有人在 Mac 上手动跑才会执行。
+      #   那些用例钉的全是「零报错但要命」的东西（订阅解析把 56 个节点切成 10 个、
+      #   块式嵌套被压平、fake-ip 池不持久化…），不进门禁的话活不过三次重构。
+      #   ★ 它能在 macOS 上原生跑，是因为 `Package.swift` 显式声明了 macOS 平台
+      #     —— 那条声明的注释里写的正是这个理由（几秒 vs `xcodebuild` 的分钟级）。
+      #   ★ 与上面那一步用同样的捞错法：一次失败要能一眼看出是哪条用例。
+      - name: Test (iOS CoastCore)
+        working-directory: ios/CoastCore
+        shell: bash
+        run: |
+          set -o pipefail
+          if swift test 2>&1 | tee /tmp/ios-core-test.log; then
+            exit 0
+          fi
+          grep -E '✘|error:|[Ff]ailed' /tmp/ios-core-test.log \
+            | head -20 \
+            | sed 's/^/::error::ios CoastCore: /' || true
           exit 1
 
       # ★ `swift test` **盖不到这一组**：它们是 headless 自检钩子（环境变量 + exit code），
