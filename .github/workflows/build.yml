@@ -2973,12 +2973,25 @@ jobs:
             exit 1
           fi
           "$CORE" -v | head -1
-          COAST_TEST_MIHOMO="$CORE" swift test --filter RealCore 2>&1 | tail -25
-          rc=${PIPESTATUS[0]}
+          COAST_TEST_MIHOMO="$CORE" swift test --filter RealCore > /tmp/realcore.log 2>&1
+          rc=$?
+          tail -25 /tmp/realcore.log
           if [ "$rc" != 0 ]; then
             echo "::error::真核心拒绝了我们生成的配置（或 REST 端到端没通）—— 见上面的输出"
             exit 1
           fi
+          # ★★ 还要判**真的跑了几条**。这一步是 CLAUDE.md 说的「改动配置生成时最要紧的
+          #   一道检查」，而它原来只看退出码：`--filter` 一旦匹配不上（套件改名、
+          #   文件被挪走、过滤语法变了），`swift test` 照样退出 0 —— 于是这道最要紧的
+          #   检查**一次都没跑却一直是绿的**，而日志里只有一行「Executed 0 tests」。
+          # ⚠️ 这个包同时装着 swift-testing 与 XCTest：RealCore 那两个套件用的是
+          #   **swift-testing**（`@Suite`），它的汇总是「Test run with N tests」；
+          #   而 XCTest 那半没有匹配项，会另外打一行「Executed 0 tests」。
+          #   只看后者会得出完全相反的结论 —— 2026-08-23 我本机就被它骗了一次。
+          n="$(grep -oE 'Test run with [0-9]+ test' /tmp/realcore.log | tail -1 | grep -oE '[0-9]+')"
+          echo "swift-testing 实际跑了 ${n:-0} 条 RealCore 用例"
+          [ -n "${n}" ] && [ "${n}" -ge 5 ] \
+            || { echo "::error::只跑了 ${n:-0} 条 RealCore 用例 —— --filter 多半没匹配上"; exit 1; }
 
       - name: Package .zip / .dmg + notarize
         working-directory: macos
