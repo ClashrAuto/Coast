@@ -366,6 +366,7 @@ jobs:
           foreach ($t in @('COAST_STATICDEPS_SELFTEST',
                            'COAST_ARPPARSE_SELFTEST', 'COAST_NICEGRESS_SELFTEST',
                            'COAST_PUBADDR_SELFTEST', 'COAST_REMOTE_SELFTEST',
+                           'COAST_MDNS_SELFTEST',
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
                            'COAST_TCPREAP_SELFTEST', 'COAST_TIDE_SELFTEST',
@@ -1330,6 +1331,12 @@ jobs:
           # 远程接入端到端。CI 上没有核心时它判 SKIP（旧核心的失败形态是「成功」，
           # 所以单独判了一次能力），有核心时会在沙箱里真跑一遍配置生成 + core -t。
           run_selftest COAST_REMOTE_SELFTEST
+          # 局域网配对的服务发现：自己写的最小 mDNS 响应器（Qt 没有 Zeroconf 模块）。
+          # ⚠️ 它验的是**报文与接口过滤**，不是「手机真能扫到」——AP 隔离、
+          #   组播被路由器拦这些在本机看不出来，写进断言只会得到一个看天气的测试。
+          #   runner 里真起服务那一段多半会 SKIP（容器里未必有能加组播的接口），
+          #   而纯函数那 20 多条是无条件跑的。
+          run_selftest COAST_MDNS_SELFTEST
           run_selftest COAST_TIDE_SELFTEST
           # 老模板迁移：它动的是**用户已经存在的**配置与台账。搬错一条 = 用户自己加的规则没了；
           # 漏改一处组名 = 规则指向不存在的组，核心拒绝**整份配置**，所有人的代理都起不来。
