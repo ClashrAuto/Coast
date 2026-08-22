@@ -2804,10 +2804,29 @@ jobs:
           bin=".build/debug/Coast"
           [ -x "$bin" ] || bin=".build/arm64-apple-macosx/debug/Coast"
           sand="$(mktemp -d)"
-          out="$(COAST_DATA_DIR="$sand" COAST_CORE_PATH="$core" COAST_NO_RELOCATE=1 \
-                 COAST_REMOTELISTEN_SELFTEST=1 "$bin" 2>&1)"; rc=$?
+          log="$RUNNER_TEMP/remotelisten.log"
+          # ★★ **必须自己搭看门狗。** mac 上没有 `timeout`（那是 GNU coreutils 的），
+          #   而这一条会**真起一个核心**：核心不上来、端口不放、下载卡住，它就一直等。
+          #   2026-08-22 实测代价远不止本腿变红：这一步挂了 23 分钟以上，而 Coast 的
+          #   构建有并发组「在跑的让它跑完」——于是**整个发布队列被它堵死**，
+          #   后面每一次推送的构建全被取消，version.json 因此一直停在原地。
+          #   ⚠️ linux/windows 两份一直有超时（240s / 300s），只有 mac 这份漏了。
+          COAST_DATA_DIR="$sand" COAST_CORE_PATH="$core" COAST_NO_RELOCATE=1 \
+            COAST_REMOTELISTEN_SELFTEST=1 "$bin" > "$log" 2>&1 &
+          pid=$!
+          ( sleep 240; kill -9 "$pid" 2>/dev/null ) &
+          dog=$!
+          wait "$pid"; rc=$?
+          kill "$dog" 2>/dev/null || true
+          out="$(cat "$log" 2>/dev/null)"
           printf '%s\n' "$out" | grep -vE '^\[remote\]|^RemoteAccess' | sed 's/^/      /'
           rm -rf "$sand"
+          # 被看门狗杀掉是 137（128+9）。它与「断言没过」是两回事，要分开说 ——
+          # 挂住多半是环境（核心没下来 / 端口被占），照着断言去查会查错方向。
+          if [ "$rc" = 137 ]; then
+            echo "::error::COAST_REMOTELISTEN_SELFTEST 240 秒未退出，已强制结束（不是断言失败）"
+            exit 1
+          fi
           if [ "$rc" != 0 ]; then
             printf '%s\n' "$out" | grep -E '^(FAIL|SKIP|===)' | tail -n 6 |
               while IFS= read -r l; do echo "::error::REMOTELISTEN | $l"; done
