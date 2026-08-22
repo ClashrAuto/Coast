@@ -1666,6 +1666,37 @@ jobs:
           # 版本号进了日志，这种事至少能在事后一眼看出来。
           echo "集成内核自报版本: $("$STAGE_DIR/core" -v | head -1)"
 
+      # ★★ 「打开远程接入之后，那个端口到底有没有真的听起来」。
+      #
+      #   2026-08-22 在一台 Windows 上看到过这个状态：`config.yaml` 写着 `remote: true`、
+      #   `full.yaml` 里 tide listener 也在、核心自己判这份配置完全合法 —— **而那个端口
+      #   从头到尾没有监听过**。界面上开关是亮的，日志里一条异常都没有；手动打一次
+      #   `PUT /configs`，端口立刻就起来了。也就是说：生成配置那一半是对的，
+      #   **把它送进运行中的核心那一半丢了**，而丢了之后没有任何人知道。
+      #
+      #   这一步是唯一会**真起核心**再验监听的：别的自检都停在「生成的 YAML 长什么样」。
+      #   它还顺带验了看门狗 —— 把核心打成那个坏状态，看它能不能自己修回来。
+      #
+      #   ⚠️ 必须放在「Bundle latest stable core」**之后**：它要一个能跑的核心，
+      #   而上面那批纯逻辑自检跑在下载内核之前。放错位置的表现是它自己 SKIP —— 绿着，
+      #   却什么都没测。
+      - name: Remote-access listener self-test (starts a real core)
+        shell: bash
+        run: |
+          set -uo pipefail
+          sand="$(mktemp -d)"
+          out="$(COAST_DATA_DIR="$sand" COAST_TEST_CORE="$STAGE_DIR/core" \
+                 COAST_REMOTELISTEN_SELFTEST=1 QT_QPA_PLATFORM=offscreen \
+                 timeout 240 "$BUILD_DIR/coast" 2>&1)"; rc=$?
+          printf '%s\n' "$out" | sed 's/^/      /'
+          rm -rf "$sand"
+          if [ "$rc" != 0 ]; then
+            printf '%s\n' "$out" | grep -E '^(FAIL|SKIP|===)' | tail -n 6 |
+              while IFS= read -r l; do echo "::error::REMOTELISTEN | $l"; done
+            echo "::error::COAST_REMOTELISTEN_SELFTEST 失败（exit=$rc）"
+            exit 1
+          fi
+
       # ★★ 让**真核心**判一遍我们生成的 full.yaml —— CLAUDE.md 说这是「改动配置生成时
       #    最要紧的一道检查」，而在此之前 CI 里**一次都没跑过**：所有 YAML 都是手拼字符串，
       #    坏了编译期零信号，运行期的表现是核心拒绝加载**整份配置**（代理整个起不来，
