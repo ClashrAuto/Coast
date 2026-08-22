@@ -367,6 +367,7 @@ jobs:
                            'COAST_ARPPARSE_SELFTEST', 'COAST_NICEGRESS_SELFTEST',
                            'COAST_PUBADDR_SELFTEST', 'COAST_REMOTE_SELFTEST',
                            'COAST_MDNS_SELFTEST', 'COAST_PAIRPROTO_SELFTEST',
+                           'COAST_PAIRSERVER_SELFTEST',
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
                            'COAST_TCPREAP_SELFTEST', 'COAST_TIDE_SELFTEST',
@@ -1341,6 +1342,10 @@ jobs:
           # ★ 那是四条线之间**唯一无条件跑的**跨线断言——从前四边都只有
           #   「设了环境变量才跑」的导入/导出测试，CI 上从来没验过一次。
           run_selftest COAST_PAIRPROTO_SELFTEST
+          # 配对服务端：真起 mDNS + HTTP，从真实 socket 上取回密文并用界面上
+          # 显示的那个码解开，再验限流、404、收摊。
+          # ⚠️ 没有可加组播的接口时（容器里常见）它明说 SKIP —— 那是环境，不是被测对象。
+          run_selftest COAST_PAIRSERVER_SELFTEST
           run_selftest COAST_TIDE_SELFTEST
           # 老模板迁移：它动的是**用户已经存在的**配置与台账。搬错一条 = 用户自己加的规则没了；
           # 漏改一处组名 = 规则指向不存在的组，核心拒绝**整份配置**，所有人的代理都起不来。
