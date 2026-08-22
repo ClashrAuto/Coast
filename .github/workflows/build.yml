@@ -2642,6 +2642,40 @@ jobs:
           #   （实测 rc=2「没有任何 if 认领它」），加了就是一条与被测对象无关的红。
           #   它只在 Qt 线存在 —— 别照着 Qt 的名单平移。
 
+      # ★★ 「打开远程接入之后，那个端口到底有没有真的听起来」+ 看门狗能不能自愈。
+      #
+      #   与 Qt 线那两条腿上的同名钩子逐条对应。**必须单独一步**：上面那个循环里的钩子
+      #   都是纯逻辑、不需要核心，而这一条要真起一个核心才有意义 —— 没核心时它自己 SKIP，
+      #   那是「绿着但什么都没测」。
+      #
+      #   ⚠️ 覆盖率门禁按**钩子名**去重，所以 Qt 那侧在跑就把这个名字算成"已覆盖"了 ——
+      #   而 Swift 那份实现是另一套代码。这一步存在的理由正是那个盲点：
+      #   同名不等于同实现（本仓库为这句话栽过，见 CLAUDE.md 里 `LOOKUP` 那条）。
+      - name: Remote-access listener self-test (starts a real core)
+        working-directory: macos
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          core="$RUNNER_TEMP/coast-core"
+          bash ../clashauto-c++/scripts/fetch_core.sh "$core" coast-darwin-arm64 || {
+            echo "::warning::取不到核心，跳过 COAST_REMOTELISTEN_SELFTEST"; exit 0; }
+          chmod +x "$core"
+          bin=".build/debug/Coast"
+          [ -x "$bin" ] || bin=".build/arm64-apple-macosx/debug/Coast"
+          sand="$(mktemp -d)"
+          out="$(COAST_DATA_DIR="$sand" COAST_CORE_PATH="$core" COAST_NO_RELOCATE=1 \
+                 COAST_REMOTELISTEN_SELFTEST=1 "$bin" 2>&1)"; rc=$?
+          printf '%s\n' "$out" | grep -vE '^\[remote\]|^RemoteAccess' | sed 's/^/      /'
+          rm -rf "$sand"
+          if [ "$rc" != 0 ]; then
+            printf '%s\n' "$out" | grep -E '^(FAIL|SKIP|===)' | tail -n 6 |
+              while IFS= read -r l; do echo "::error::REMOTELISTEN | $l"; done
+            echo "::error::COAST_REMOTELISTEN_SELFTEST 失败（exit=$rc）"
+            exit 1
+          fi
+
       - name: Check i18n coverage
         working-directory: macos
         run: |
