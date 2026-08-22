@@ -243,6 +243,30 @@ jobs:
             $args += "-DQT_HOST_PATH=$hostQt"
           }
           cmake @args
+          # ★★ x64 上必须真的开了 OpenSSL。**这一步存在的全部意义是把「静默回退」变成红灯** ——
+          #   链不上时 CMake 只打一行 STATUS 就继续，包照样出得来，只是 ss/vmess/reality
+          #   不走进程内栈，而那没有任何运行期报错。2026-08-22 查明出货的 x64 包一直是这个状态。
+          # ⚠️ arm64 不判：那是交叉编译，环境里本就没有 arm64 的 OpenSSL，回退是**设计如此**。
+          if ("${{ matrix.arch }}" -eq "x64") {
+            $cache = Get-Content "$env:BUILD_DIR/CMakeCache.txt" -Raw
+            if ($cache -notmatch "COAST_OPENSSL_LINKS:INTERNAL=1") {
+              Write-Host "::error::Windows x64 的 OpenSSL 真链没过 —— ss/vmess/reality 会静默回退 mihomo"
+              # 把 try_compile 的失败原因吐出来：判据是"链不上"，而**为什么**只在这份日志里。
+              $log = "$env:BUILD_DIR/CMakeFiles/CMakeConfigureLog.yaml"
+              if (Test-Path $log) {
+                Get-Content $log | Select-String -Pattern "COAST_OPENSSL_LINKS" -Context 0,40 |
+                  Select-Object -First 1 | ForEach-Object { $_.ToString() } |
+                  ForEach-Object { $_ -split "`n" } | Select-Object -First 40 |
+                  ForEach-Object { Write-Host "  $_" }
+              } else {
+                Write-Host "  （没有 CMakeConfigureLog.yaml，试 CMakeError.log）"
+                Get-Content "$env:BUILD_DIR/CMakeFiles/CMakeError.log" -Tail 40 -ErrorAction SilentlyContinue |
+                  ForEach-Object { Write-Host "  $_" }
+              }
+              exit 1
+            }
+            Write-Host "OpenSSL 真链通过（COAST_OPENSSL_LINKS=1）"
+          }
 
       - name: Build
         shell: pwsh
