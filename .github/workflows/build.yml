@@ -64,6 +64,18 @@ env:
   SOURCE_REPO: ClashrAuto/clashauto
   SOURCE_REF: >-
     ${{ github.event.inputs.ref || github.event.client_payload.ref || 'master' }}
+  # ★★ 检出**钉死到具体 commit**，而 SOURCE_REF 只用来判「正式版还是 beta」。
+  #
+  #   两者必须分开：分支名是那个判据的唯一来源（`master`/`main` = 正式版），
+  #   但拿分支名去 checkout 意味着**每个 job 各自解析一次分支尖端** ——
+  #   构建期间源仓库只要有一次推送，各 job 就检出到不同的 commit，
+  #   于是它们各自 `git rev-list --count HEAD` 算出**不同的版本号**。
+  #   2026-08-23 实测：平台 job 传到 v1.1.10x，manifest job 却去找
+  #   `v1.1.108-beta.34cb199`（更新的那个 commit），报「release tag 不存在」当场红，
+  #   而每条腿看起来都是好的。CLAUDE.md 里记的「产物分裂到两个 release」是同一个病根。
+  #   ⚠️ 留空时退回 SOURCE_REF —— 手工 workflow_dispatch 没有 sha 可传。
+  SOURCE_SHA: >-
+    ${{ github.event.inputs.sha || github.event.client_payload.sha || '' }}
   APP_NAME: Coast
   # ★ Qt 版本**按平台分开**：Windows / macOS 走 6.11，Linux 留在 6.8.3。
   #   分开写而不是一个全局值，是因为这两组的约束不一样，将来抬版本也不会同步动。
@@ -108,7 +120,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_REF }}
+          ref: ${{ env.SOURCE_SHA || env.SOURCE_REF }}
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
           fetch-depth: 0
 
@@ -903,7 +915,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_REF }}
+          ref: ${{ env.SOURCE_SHA || env.SOURCE_REF }}
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
           fetch-depth: 0
 
@@ -1364,7 +1376,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_REF }}
+          ref: ${{ env.SOURCE_SHA || env.SOURCE_REF }}
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
           fetch-depth: 0
 
@@ -2069,7 +2081,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_REF }}
+          ref: ${{ env.SOURCE_SHA || env.SOURCE_REF }}
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
           fetch-depth: 0
 
@@ -2317,7 +2329,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_REF }}
+          ref: ${{ env.SOURCE_SHA || env.SOURCE_REF }}
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
           # ★ 必须 0：版本号是 `major.minor.<提交数>`，而默认的浅克隆只有 1 个提交，
           #   `git rev-list --count HEAD` 会返回 1 —— 本 job 第一次上线就是这么算出
@@ -2402,7 +2414,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_REF }}
+          ref: ${{ env.SOURCE_SHA || env.SOURCE_REF }}
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
       - name: Download linux x64 artifact
         uses: actions/download-artifact@v4
@@ -2454,7 +2466,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_REF }}
+          ref: ${{ env.SOURCE_SHA || env.SOURCE_REF }}
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
           fetch-depth: 0
 
@@ -2583,7 +2595,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPO }}
-          ref: ${{ env.SOURCE_REF }}
+          ref: ${{ env.SOURCE_SHA || env.SOURCE_REF }}
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
           fetch-depth: 0
 
