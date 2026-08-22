@@ -366,7 +366,7 @@ jobs:
           foreach ($t in @('COAST_STATICDEPS_SELFTEST',
                            'COAST_ARPPARSE_SELFTEST', 'COAST_NICEGRESS_SELFTEST',
                            'COAST_PUBADDR_SELFTEST', 'COAST_REMOTE_SELFTEST',
-                           'COAST_MDNS_SELFTEST',
+                           'COAST_MDNS_SELFTEST', 'COAST_PAIRPROTO_SELFTEST',
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
                            'COAST_TCPREAP_SELFTEST', 'COAST_TIDE_SELFTEST',
@@ -1337,6 +1337,10 @@ jobs:
           #   runner 里真起服务那一段多半会 SKIP（容器里未必有能加组播的接口），
           #   而纯函数那 20 多条是无条件跑的。
           run_selftest COAST_MDNS_SELFTEST
+          # 配对的密码学契约，含四条线共用的那份固定向量（KAT）。
+          # ★ 那是四条线之间**唯一无条件跑的**跨线断言——从前四边都只有
+          #   「设了环境变量才跑」的导入/导出测试，CI 上从来没验过一次。
+          run_selftest COAST_PAIRPROTO_SELFTEST
           run_selftest COAST_TIDE_SELFTEST
           # 老模板迁移：它动的是**用户已经存在的**配置与台账。搬错一条 = 用户自己加的规则没了；
           # 漏改一处组名 = 规则指向不存在的组，核心拒绝**整份配置**，所有人的代理都起不来。
