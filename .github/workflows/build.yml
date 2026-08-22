@@ -2183,7 +2183,14 @@ jobs:
       - name: Unit tests
         shell: bash
         working-directory: android
-        run: ./gradlew :core:test --console=plain
+        run: |
+          set -euo pipefail
+          ./gradlew :core:test --console=plain
+          # ★★ 还要判**跑了多少条**：`BUILD SUCCESSFUL` 有两种，其中一种是任务
+          #   up-to-date、一条都没跑（本机实测 8 秒零测试）。理由见脚本头部。
+          # ⚠️ 别把这段 python 写成 heredoc 塞进这里：块标量里那些行会带着缩进传给
+          #   python，第一行就是 IndentationError；顶格写又会当场结束 YAML 块标量。
+          python3 scripts/test_count_check.py
 
       - name: Build release APK
         shell: bash
