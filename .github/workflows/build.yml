@@ -373,6 +373,7 @@ jobs:
                            'COAST_MDNS_SELFTEST', 'COAST_PAIRPROTO_SELFTEST',
                            'COAST_PAIRSERVER_SELFTEST', 'COAST_ADVERTISE_SELFTEST',
                            'COAST_PAIRSESSION_SELFTEST', 'COAST_PAIRECDH_SELFTEST',
+                           'COAST_QMLLOAD_SELFTEST',
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
                            'COAST_TCPREAP_SELFTEST', 'COAST_TIDE_SELFTEST',
@@ -1443,6 +1444,13 @@ jobs:
           #   泄露一次就等于把配对整个绕过去了。
           # ⚠️ 真凭据那一段要可执行的核心（COAST_ADVERTISE_CORE），CI 上没有，明说 SKIP。
           run_selftest COAST_ADVERTISE_SELFTEST
+          # ★★ 真加载一遍 QML：七页逐页切过去，再把那些**只在有数据时才实例化**的
+          #   委托（配对列表、确认卡片覆盖层）撑起来，断言一条 QML 警告都没有。
+          #   QML 的错误**构建期零信号**，运行期也只在该组件真被实例化时才打一行 ——
+          #   出货的 v1.0.1143 里确认卡片上那个勾选框就是这样既错位又完全点不动的。
+          #   ⚠️ `qml_positioner_check.py` 是静态近似（只判一种），这条是真加载。
+          #   变异验证过两次都会红：布局直接子项加 anchors、绑定里调不存在的方法。
+          run_selftest COAST_QMLLOAD_SELFTEST
           # 配对第 2 版的派生层：ECDH 共享密钥 → 对称密钥 + 6 位显示码。
           # ★ 那份跨线固定向量挡的是「两边算出的码不一样」——而那个现象
           #   **看起来像中间人攻击**，是这套东西最不该出的误报。
