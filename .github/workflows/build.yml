@@ -880,6 +880,46 @@ jobs:
       #      （分支 clashauto-mac），而用户拿到的签名包是那边出的 —— 只删这边不改那边，
       #      出货的图标依旧是坏的。两处必须一起删。
 
+      # ★★ **universal 的 libcrypto**。没有它，`COAST_HAVE_OPENSSL` 在这条腿上
+      #   **按设计**是 OFF —— runner 自带的 homebrew libcrypto 只有一个架构，
+      #   CMake 那道「真链一次」的测试在 universal 模式下必然失败。
+      #   代价不是"少一个可选特性"，是两件用户看得见的事：
+      #     · ss / vmess / reality 三个进程内协议静默回退 mihomo（一直如此，无人发现）；
+      #     · 配对的 AES-GCM 没有实现 → 这条线上「配对手机」直接不可用。
+      #   2026-08-22 本地验过：两个架构各编一份 libcrypto 再 lipo 合并，
+      #   universal 模式下那道真链测试就过了。
+      # ★ 带缓存：第一次约两分钟，之后命中就是解压。
+      - name: Cache universal libcrypto
+        id: ossl-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/ossl-universal
+          key: ossl-universal-3.0.15-macos14-v1
+
+      - name: Build universal libcrypto (cache miss)
+        if: steps.ossl-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -sL -o openssl.tar.gz \
+            https://github.com/openssl/openssl/releases/download/openssl-3.0.15/openssl-3.0.15.tar.gz
+          tar xzf openssl.tar.gz
+          # ⚠️ 3.0.x **不认** `no-docs` / `no-apps`（"Unsupported options"），别顺手加。
+          for arch in arm64 x86_64; do
+            tgt="darwin64-$arch-cc"
+            rm -rf "b-$arch"; cp -R openssl-3.0.15 "b-$arch"
+            ( cd "b-$arch"
+              ./Configure "$tgt" no-shared no-tests --prefix="$RUNNER_TEMP/out-$arch" >/dev/null
+              make -j"$(sysctl -n hw.ncpu)" build_libs >/dev/null
+              make install_dev >/dev/null )
+          done
+          mkdir -p ossl-universal/lib ossl-universal/include
+          lipo -create "out-arm64/lib/libcrypto.a" "out-x86_64/lib/libcrypto.a" \
+               -output ossl-universal/lib/libcrypto.a
+          cp -R "out-arm64/include/." ossl-universal/include/
+          lipo -info ossl-universal/lib/libcrypto.a
+
       - name: Configure
         shell: bash
         run: |
@@ -887,8 +927,21 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DAPP_VERSION="$APP_VERSION" \
             -DCMAKE_PREFIX_PATH="$QT_ROOT" \
+            -DOPENSSL_ROOT_DIR="$RUNNER_TEMP/ossl-universal" \
             -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64" \
             -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+          # ★★ 明确断言它真的开了。**这一步存在的全部意义就是把「静默回退」变成红灯** ——
+          #   OpenSSL 不可用时 CMake 只打一行 STATUS 就继续，产物照样出得来，
+          #   只是少了三个协议和配对，而那两件事都没有任何运行期报错。
+          # ⚠️ 判据是 `COAST_OPENSSL_LINKS`（check_cxx_source_compiles 落进 CMakeCache 的
+          #   那个 INTERNAL 变量）。`COAST_HAVE_OPENSSL` 是普通 set，**不在 CMakeCache 里**，
+          #   拿它做判据的话这条断言永远通不过。
+          if ! grep -qx "COAST_OPENSSL_LINKS:INTERNAL=1" "$BUILD_DIR/CMakeCache.txt"; then
+            echo "::error::universal libcrypto 没能让 OpenSSL 真链通过 —— 三个进程内协议与配对都会缺"
+            grep -n "OPENSSL" "$BUILD_DIR/CMakeCache.txt" | head -10
+            exit 1
+          fi
+          echo "OpenSSL 真链通过（COAST_OPENSSL_LINKS=1）
 
       - name: Build
         shell: bash
