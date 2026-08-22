@@ -2057,6 +2057,31 @@ jobs:
           python3 android/scripts/fetch_core.py
           ls -l android/app/src/main/jniLibs/*/libcoast.so
 
+      # ★★ 先把 Gradle 发行版拉下来，**带重试**。
+      #   2026-08-23 实测：`./gradlew` 第一次跑会去 services.gradle.org 下
+      #   `gradle-8.11.1-bin.zip`，那一下被 `SocketException: Connection reset`
+      #   打断，整个 Android job 当场红。
+      # ⚠️ 代价远不止「重跑一次」：`manifest` job `needs: [windows, linux, android]`，
+      #   于是**一次与代码无关的网络抖动会让 version.json 整份停在原地** ——
+      #   六个平台的用户一起查不到新版本，而每条腿看起来都是好的。
+      #   实测清单因此卡在 1.1.90 足足 13 个版本，两边 CI 全绿。
+      - name: Warm up Gradle wrapper
+        shell: bash
+        working-directory: android
+        run: |
+          set -uo pipefail
+          for i in 1 2 3 4 5; do
+            if ./gradlew --version --console=plain > /tmp/gradlew-warm.log 2>&1; then
+              echo "Gradle 就绪（第 ${i} 次）"
+              exit 0
+            fi
+            echo "::warning::第 ${i} 次拉 Gradle 发行版失败，10 秒后重试"
+            tail -5 /tmp/gradlew-warm.log
+            sleep 10
+          done
+          echo "::error::连续 5 次拉不到 Gradle 发行版 —— 这次多半真的是上游挂了"
+          exit 1
+
       - name: Unit tests
         shell: bash
         working-directory: android
