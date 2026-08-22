@@ -1783,10 +1783,24 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
+          # ⚠️ **`set -uo pipefail` 关不掉 `-e`。** GitHub 的 `shell: bash` 实际是
+          #   `bash --noprofile --norc -e -o pipefail`，`-e` 来自命令行、不在脚本里，
+          #   所以「`cmd; rc=$?` 再拿 rc 去分诊」这种写法**永远走不到分诊那一步** ——
+          #   命令一失败 shell 当场退出，整段精心写的 `::error::` 全是死代码。
+          #   2026-08-22 实测：看门狗把它杀了（137），而日志里一个字的解释都没有，
+          #   只有一行 `Process completed with exit code 137`。
+          #   所以取退出码一律写成 `rc=0; cmd || rc=$?`。
           sand="$(mktemp -d)"
+          rc=0
           out="$(COAST_DATA_DIR="$sand" COAST_TEST_CORE="$STAGE_DIR/core" \
                  COAST_REMOTELISTEN_SELFTEST=1 QT_QPA_PLATFORM=offscreen \
-                 timeout 240 "$BUILD_DIR/coast" 2>&1)"; rc=$?
+                 timeout 240 "$BUILD_DIR/coast" 2>&1)" || rc=$?
+          # `timeout` 超时回 124，与断言失败分开说。
+          if [ "$rc" = 124 ]; then
+            printf '%s\n' "$out" | sed 's/^/      /'
+            echo "::error::COAST_REMOTELISTEN_SELFTEST 240 秒未退出（不是断言失败）"
+            exit 1
+          fi
           printf '%s\n' "$out" | sed 's/^/      /'
           rm -rf "$sand"
           if [ "$rc" != 0 ]; then
@@ -2828,7 +2842,15 @@ jobs:
           pid=$!
           ( sleep 240; kill -9 "$pid" 2>/dev/null ) &
           dog=$!
-          wait "$pid"; rc=$?
+          # ⚠️ **`set -uo pipefail` 关不掉 `-e`。** GitHub 的 `shell: bash` 实际是
+          #   `bash --noprofile --norc -e -o pipefail`，`-e` 来自命令行、不在脚本里，
+          #   所以「`cmd; rc=$?` 再拿 rc 去分诊」这种写法**永远走不到分诊那一步** ——
+          #   命令一失败 shell 当场退出，整段精心写的 `::error::` 全是死代码。
+          #   2026-08-22 实测：看门狗把它杀了（137），而日志里一个字的解释都没有，
+          #   只有一行 `Process completed with exit code 137`。
+          #   所以取退出码一律写成 `rc=0; cmd || rc=$?`。
+          rc=0
+          wait "$pid" || rc=$?
           kill "$dog" 2>/dev/null || true
           out="$(cat "$log" 2>/dev/null)"
           printf '%s\n' "$out" | grep -vE '^\[remote\]|^RemoteAccess' | sed 's/^/      /'
