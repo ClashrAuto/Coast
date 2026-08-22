@@ -1382,9 +1382,13 @@ jobs:
           #   （反过来说：这些自测本身都是毫秒级的，30 秒到不了就一定是出事了，不是慢。）
           run_selftest() {
             local name="$1"
+            # ★ 第二个参数是超时秒数，缺省 30。绝大多数钩子是纯逻辑、秒级返回，
+            #   放宽反而会让"挂住"重新变成一次漫长的等待。只有确实要起整套后端的
+            #   （COAST_QMLLOAD_SELFTEST）才单独给更长的值。
+            local secs="${2:-30}"
             local out rc
             set +e
-            out="$(timeout 30 env "$name=1" "$bin" 2>&1)"; rc=$?
+            out="$(timeout "$secs" env "$name=1" "$bin" 2>&1)"; rc=$?
             set -e
             if [ "$rc" = 0 ]; then
               echo "PASS  $name"
@@ -1402,7 +1406,8 @@ jobs:
               [ -n "$l" ] && echo "::error::$name | $l"
             done
             if [ "$rc" = 124 ]; then
-              echo "::error::$name 30 秒未退出 —— 多半是这个钩子没在 main_qml.cpp 里注册"
+              echo "::error::$name ${secs} 秒未退出 —— 多半是这个钩子没在 main_qml.cpp 里注册，"
+              echo "::error::  但也可能是它跑完了却卡在退出路径上（看上面有没有 PASS/FAIL 那一行）"
               echo "::error::（或被裹进了某个平台专属的 #ifdef），于是设了 env 只是把 GUI 启动起来"
             else
               echo "::error::$name 失败（exit=$rc）"
@@ -1450,7 +1455,7 @@ jobs:
           #   出货的 v1.0.1143 里确认卡片上那个勾选框就是这样既错位又完全点不动的。
           #   ⚠️ `qml_positioner_check.py` 是静态近似（只判一种），这条是真加载。
           #   变异验证过两次都会红：布局直接子项加 anchors、绑定里调不存在的方法。
-          run_selftest COAST_QMLLOAD_SELFTEST
+          run_selftest COAST_QMLLOAD_SELFTEST 120
           # 配对第 2 版的派生层：ECDH 共享密钥 → 对称密钥 + 6 位显示码。
           # ★ 那份跨线固定向量挡的是「两边算出的码不一样」——而那个现象
           #   **看起来像中间人攻击**，是这套东西最不该出的误报。
