@@ -123,7 +123,11 @@ jobs:
 
           $major = $Matches[1]
           $minor = if ($Matches[2]) { $Matches[2] } else { "0" }
-          $build = "$(git rev-list --count HEAD)".Trim()
+          # patch 从**本分支的基线**起算，不是全仓库累计。见 .github/version-base。
+          $baseSha = (Get-Content ".github\version-base" | Where-Object { $_ -notmatch '^\s*(#|$)' } | Select-Object -First 1).Trim()
+          if (-not $baseSha) { throw "read .github/version-base failed" }
+          $build = "$(git rev-list --count "$baseSha..HEAD")".Trim()
+          if ($LASTEXITCODE -ne 0) { throw "version base $baseSha not in history" }
           $version = "$major.$minor.$build"
           # 主分支 = 正式版，其余分支 = prerelease。
           # APP_VERSION 保持纯数字 major.minor.build —— 资源文件名(Coast-<ver>-…)和 app 内的
@@ -397,7 +401,14 @@ jobs:
               exit 1
             }
             if ($p.ExitCode -ne 0) {
-              if (Test-Path $out) { Get-Content $out }
+              if (Test-Path $out) {
+                Get-Content $out
+                # ★★ 把输出的尾巴也吐成 annotation。作业日志的下载接口要仓库 admin 权限，
+                #   而 annotation 是**公开可读**的 —— 同一个理由上面 Build 那步已经写过一次。
+                #   没有这几行时，「COAST_XXX_SELFTEST 失败（exit=1）」是外面唯一看得到的
+                #   信息，而那句话不含任何可据以定位的东西。
+                Get-Content $out -Tail 14 | ForEach-Object { Write-Host "::error::$t | $_" }
+              }
               Write-Host "::error::$t 失败（exit=$($p.ExitCode)）"
               exit 1
             }
@@ -794,7 +805,11 @@ jobs:
           major="$(echo "$base" | cut -d. -f1)"
           minor="$(echo "$base" | cut -d. -f2)"
           [ -n "$minor" ] || minor=0
-          build="$(git rev-list --count HEAD)"
+          # patch 从**本分支的基线**起算，不是全仓库累计。见 .github/version-base。
+          # ⚠️ 基线不在历史里时 git 直接报错、`set -e` 让这一步失败 —— 那是故意的。
+          base_sha="$(grep -vE '^[[:space:]]*(#|$)' .github/version-base | head -n1 | tr -d '[:space:]')"
+          [ -n "$base_sha" ] || { echo "read .github/version-base failed" >&2; exit 1; }
+          build="$(git rev-list --count "${base_sha}..HEAD")"
           version="${major}.${minor}.${build}"
           # 主分支 = 正式版，其余分支 = prerelease。取舍见 windows job 那段注释。
           if [ "${SOURCE_REF}" = "master" ] || [ "${SOURCE_REF}" = "main" ]; then
@@ -1198,7 +1213,11 @@ jobs:
           major="$(echo "$base" | cut -d. -f1)"
           minor="$(echo "$base" | cut -d. -f2)"
           [ -n "$minor" ] || minor=0
-          build="$(git rev-list --count HEAD)"
+          # patch 从**本分支的基线**起算，不是全仓库累计。见 .github/version-base。
+          # ⚠️ 基线不在历史里时 git 直接报错、`set -e` 让这一步失败 —— 那是故意的。
+          base_sha="$(grep -vE '^[[:space:]]*(#|$)' .github/version-base | head -n1 | tr -d '[:space:]')"
+          [ -n "$base_sha" ] || { echo "read .github/version-base failed" >&2; exit 1; }
+          build="$(git rev-list --count "${base_sha}..HEAD")"
           version="${major}.${minor}.${build}"
           # 主分支 = 正式版，其余分支 = prerelease。取舍见 windows job 那段注释。
           if [ "${SOURCE_REF}" = "master" ] || [ "${SOURCE_REF}" = "main" ]; then
@@ -1308,6 +1327,11 @@ jobs:
               return 0
             fi
             printf '%s\n' "$out" | sed 's/^/      /'
+            # ★★ 尾巴也吐成 annotation：作业日志要仓库 admin 权限，annotation 公开可读。
+            #   没有这几行时，外面看得到的只有「$name 失败（exit=N）」，不含任何可定位的东西。
+            printf '%s\n' "$out" | tail -n 14 | while IFS= read -r l; do
+              echo "::error::$name | $l"
+            done
             if [ "$rc" = 124 ]; then
               echo "::error::$name 30 秒未退出 —— 多半是这个钩子没在 main_qml.cpp 里注册"
               echo "::error::（或被裹进了某个平台专属的 #ifdef），于是设了 env 只是把 GUI 启动起来"
@@ -1799,7 +1823,11 @@ jobs:
           major="$(echo "$base" | cut -d. -f1)"
           minor="$(echo "$base" | cut -d. -f2)"
           [ -n "$minor" ] || minor=0
-          build="$(git rev-list --count HEAD)"
+          # patch 从**本分支的基线**起算，不是全仓库累计。见 .github/version-base。
+          # ⚠️ 基线不在历史里时 git 直接报错、`set -e` 让这一步失败 —— 那是故意的。
+          base_sha="$(grep -vE '^[[:space:]]*(#|$)' .github/version-base | head -n1 | tr -d '[:space:]')"
+          [ -n "$base_sha" ] || { echo "read .github/version-base failed" >&2; exit 1; }
+          build="$(git rev-list --count "${base_sha}..HEAD")"
           version="${major}.${minor}.${build}"
           if [ "${SOURCE_REF}" = "master" ] || [ "${SOURCE_REF}" = "main" ]; then
             is_pre=false; tag="v$version"
@@ -1978,7 +2006,10 @@ jobs:
           [ -n "$base" ] || { echo "::error::CMakeLists 里找不到 project VERSION"; exit 1; }
           major="$(echo "$base" | cut -d. -f1)"
           minor="$(echo "$base" | cut -d. -f2)"; [ -n "$minor" ] || minor=0
-          version="${major}.${minor}.$(git rev-list --count HEAD)"
+          # patch 从**本分支的基线**起算，不是全仓库累计。见 .github/version-base。
+          base_sha="$(grep -vE '^[[:space:]]*(#|$)' .github/version-base | head -n1 | tr -d '[:space:]')"
+          [ -n "$base_sha" ] || { echo "read .github/version-base failed" >&2; exit 1; }
+          version="${major}.${minor}.$(git rev-list --count "${base_sha}..HEAD")"
           if [ "${SOURCE_REF}" = "master" ] || [ "${SOURCE_REF}" = "main" ]; then
             echo "tag=v${version}" >> "$GITHUB_OUTPUT"
             echo "channel=release" >> "$GITHUB_OUTPUT"
@@ -2110,7 +2141,10 @@ jobs:
           [ -n "$base" ] || { echo "Cannot find project VERSION in clashauto-c++/CMakeLists.txt" >&2; exit 1; }
           major="$(echo "$base" | cut -d. -f1)"
           minor="$(echo "$base" | cut -d. -f2)"; [ -n "$minor" ] || minor=0
-          version="${major}.${minor}.$(git rev-list --count HEAD)"
+          # patch 从**本分支的基线**起算，不是全仓库累计。见 .github/version-base。
+          base_sha="$(grep -vE '^[[:space:]]*(#|$)' .github/version-base | head -n1 | tr -d '[:space:]')"
+          [ -n "$base_sha" ] || { echo "read .github/version-base failed" >&2; exit 1; }
+          version="${major}.${minor}.$(git rev-list --count "${base_sha}..HEAD")"
           if [ "${SOURCE_REF}" = "master" ] || [ "${SOURCE_REF}" = "main" ]; then
             is_pre=false; tag="v${version}"
           else
@@ -2261,7 +2295,10 @@ jobs:
           #   而 trigger-mac 是按**它自己**那份算的目标 tag 通知 schat.build 的，
           #   于是签名包会发到一个本腿产物之外的 tag 上。属于低概率但后果很脏的一类。
           [ -n "$minor" ] || minor=0
-          count="$(git rev-list --count HEAD)"
+          # patch 从**本分支的基线**起算，不是全仓库累计。见 .github/version-base。
+          base_sha="$(grep -vE '^[[:space:]]*(#|$)' .github/version-base | head -n1 | tr -d '[:space:]')"
+          [ -n "$base_sha" ] || { echo "read .github/version-base failed" >&2; exit 1; }
+          count="$(git rev-list --count "${base_sha}..HEAD")"
           version="${major}.${minor}.${count}"
           # 主分支 = 正式版，其余分支 = prerelease。tag 再缀短 sha，
           # 防「两个分支各 +N 撞到同一个号」。口径与 windows/linux job 完全一致。
