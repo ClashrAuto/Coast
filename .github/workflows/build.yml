@@ -943,7 +943,7 @@ jobs:
             grep -n "OPENSSL" "$BUILD_DIR/CMakeCache.txt" | head -10
             exit 1
           fi
-          echo "OpenSSL 真链通过（COAST_OPENSSL_LINKS=1）
+          echo "OpenSSL 真链通过（COAST_OPENSSL_LINKS=1）"
 
       - name: Build
         shell: bash
