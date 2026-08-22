@@ -372,7 +372,7 @@ jobs:
                            'COAST_PUBADDR_SELFTEST', 'COAST_REMOTE_SELFTEST',
                            'COAST_MDNS_SELFTEST', 'COAST_PAIRPROTO_SELFTEST',
                            'COAST_PAIRSERVER_SELFTEST', 'COAST_ADVERTISE_SELFTEST',
-                           'COAST_PAIRSESSION_SELFTEST',
+                           'COAST_PAIRSESSION_SELFTEST', 'COAST_PAIRECDH_SELFTEST',
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
                            'COAST_TCPREAP_SELFTEST', 'COAST_TIDE_SELFTEST',
@@ -1447,6 +1447,10 @@ jobs:
           # ★ 那份跨线固定向量挡的是「两边算出的码不一样」——而那个现象
           #   **看起来像中间人攻击**，是这套东西最不该出的误报。
           run_selftest COAST_PAIRSESSION_SELFTEST
+          # 配对第 2 版的密钥协商：P-256 ECDH。最要紧的一条是「两侧算出同一个
+          # 共享密钥」——不成立的话「两边比对同一个码」的整套设计就塌了。
+          # 另有一条挡 invalid-curve 攻击（不在曲线上的点必须被拒）。
+          run_selftest COAST_PAIRECDH_SELFTEST
           run_selftest COAST_TIDE_SELFTEST
           # 老模板迁移：它动的是**用户已经存在的**配置与台账。搬错一条 = 用户自己加的规则没了；
           # 漏改一处组名 = 规则指向不存在的组，核心拒绝**整份配置**，所有人的代理都起不来。
