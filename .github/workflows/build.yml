@@ -407,7 +407,16 @@ jobs:
                 #   而 annotation 是**公开可读**的 —— 同一个理由上面 Build 那步已经写过一次。
                 #   没有这几行时，「COAST_XXX_SELFTEST 失败（exit=1）」是外面唯一看得到的
                 #   信息，而那句话不含任何可据以定位的东西。
-                Get-Content $out -Tail 14 | ForEach-Object { Write-Host "::error::$t | $_" }
+                # ⚠️ **GitHub 每个 step 最多 10 条 error annotation**，多的直接丢。
+                #   所以不能傻吐尾巴 14 行 —— 2026-08-22 实测：吐出来的 10 条全是 `OK`，
+                #   而真正有用的 `FAIL …` 与 `=== FAIL（N 条）===` 恰好排在第 11 条之后，
+                #   于是「看得到红灯、看不到原因」原封不动地又发生了一次。
+                #   只挑 FAIL/SKIP/=== 这几类关键行，且最多 8 条。
+                $keep = Get-Content $out |
+                        Where-Object { $_ -match '^(FAIL|SKIP|===)' -or $_ -match 'FAIL' } |
+                        Select-Object -Last 8
+                if (-not $keep) { $keep = Get-Content $out -Tail 6 }
+                foreach ($l in $keep) { Write-Host "::error::$t | $l" }
               }
               Write-Host "::error::$t 失败（exit=$($p.ExitCode)）"
               exit 1
@@ -1329,8 +1338,13 @@ jobs:
             printf '%s\n' "$out" | sed 's/^/      /'
             # ★★ 尾巴也吐成 annotation：作业日志要仓库 admin 权限，annotation 公开可读。
             #   没有这几行时，外面看得到的只有「$name 失败（exit=N）」，不含任何可定位的东西。
-            printf '%s\n' "$out" | tail -n 14 | while IFS= read -r l; do
-              echo "::error::$name | $l"
+            # ⚠️ GitHub 每个 step 最多 10 条 error annotation，多的直接丢 ——
+            #   傻吐尾巴会让真正有用的那几行被挤掉（Windows 那侧实测过）。
+            #   只挑 FAIL/SKIP/=== 这几类关键行，且最多 8 条。
+            keep="$(printf '%s\n' "$out" | grep -E '^(FAIL|SKIP|===)|FAIL' | tail -n 8 || true)"
+            [ -n "$keep" ] || keep="$(printf '%s\n' "$out" | tail -n 6)"
+            printf '%s\n' "$keep" | while IFS= read -r l; do
+              [ -n "$l" ] && echo "::error::$name | $l"
             done
             if [ "$rc" = 124 ]; then
               echo "::error::$name 30 秒未退出 —— 多半是这个钩子没在 main_qml.cpp 里注册"
