@@ -826,6 +826,9 @@ jobs:
         run: printf '%s\n' "$COMMIT_MSG" > release-notes.md
 
       - name: Upload to GitHub Release
+        id: ghrelease
+        # ★ 失败不直接红：下面那一步会只补传资源。理由见它的注释。
+        continue-on-error: true
         if: (github.event.inputs.publish || github.event.client_payload.publish || 'true') != 'false'
         uses: softprops/action-gh-release@v2
         with:
@@ -848,6 +851,39 @@ jobs:
           overwrite_files: true
           files: |
             dist/Coast-*
+
+      # ★★ 兜底：**只补传资源，一个字段的元数据都不碰。**
+      #
+      #   2026-08-23 实测：如果这条 release 是 schat.build 先建出来的
+      #   （它算版本号用的是 clashauto 分支尖端而不是 trigger 传过去的 tag，
+      #   于是会为一个 Coast 还没构建的 tag 先建好 release，`target_commitish` 是 `main`），
+      #   softprops 接着就会去把 commitish 改成本仓库的 sha，那个 PATCH 被拒：
+      #   `Resource not accessible by integration`。
+      #
+      #   代价大到不成比例：**六个平台的包一个都传不上去**，release 上只剩 4 个 mac DMG，
+      #   而 `manifest` job `needs` 这些平台 → version.json 整份不动 → 所有用户查不到更新。
+      #   实测这样的残缺 release 已经出过三个（v1.1.99 / v1.1.101 / v1.1.104）。
+      #
+      #   ⚠️ 真正的错在 schat.build（本仓库没有推送权限），所以这里不是"修好了"，
+      #   是**别让它连累打包**。`gh release upload` 只调上传资源那个端点，
+      #   不碰 name/body/commitish，因此不受那道拒绝影响。
+      - name: Upload assets (fallback, metadata untouched)
+        if: github.event_name == 'push' && steps.ghrelease.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "::warning::softprops 那一步失败了，改用 gh 只补传资源（多半是 release 被 schat.build 先建走了）"
+          shopt -s nullglob
+          files=(dist/Coast-*)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::没有可传的产物"; exit 1; }
+          # release 不存在时 gh 会明说 "release not found" —— 那说明连**创建**都没成功，
+          # 与本兜底针对的「已存在但改不动」是两回事，此时红出来是对的。
+          gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null \
+            || { echo "::error::release ${RELEASE_TAG} 根本不存在 —— 不是元数据被拒，是创建失败了"; exit 1; }
+          gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+          echo "补传了 ${#files[@]} 个文件"
 
   macos:
     name: macOS universal Qt (x86_64 + arm64)
@@ -1956,6 +1992,9 @@ jobs:
         run: printf '%s\n' "$COMMIT_MSG" > release-notes.md
 
       - name: Upload to GitHub Release
+        id: ghrelease
+        # ★ 失败不直接红：下面那一步会只补传资源。理由见它的注释。
+        continue-on-error: true
         if: (github.event.inputs.publish || github.event.client_payload.publish || 'true') != 'false'
         uses: softprops/action-gh-release@v2
         with:
@@ -1978,6 +2017,39 @@ jobs:
           overwrite_files: true
           files: |
             dist/Coast-*-linux-*
+
+      # ★★ 兜底：**只补传资源，一个字段的元数据都不碰。**
+      #
+      #   2026-08-23 实测：如果这条 release 是 schat.build 先建出来的
+      #   （它算版本号用的是 clashauto 分支尖端而不是 trigger 传过去的 tag，
+      #   于是会为一个 Coast 还没构建的 tag 先建好 release，`target_commitish` 是 `main`），
+      #   softprops 接着就会去把 commitish 改成本仓库的 sha，那个 PATCH 被拒：
+      #   `Resource not accessible by integration`。
+      #
+      #   代价大到不成比例：**六个平台的包一个都传不上去**，release 上只剩 4 个 mac DMG，
+      #   而 `manifest` job `needs` 这些平台 → version.json 整份不动 → 所有用户查不到更新。
+      #   实测这样的残缺 release 已经出过三个（v1.1.99 / v1.1.101 / v1.1.104）。
+      #
+      #   ⚠️ 真正的错在 schat.build（本仓库没有推送权限），所以这里不是"修好了"，
+      #   是**别让它连累打包**。`gh release upload` 只调上传资源那个端点，
+      #   不碰 name/body/commitish，因此不受那道拒绝影响。
+      - name: Upload assets (fallback, metadata untouched)
+        if: github.event_name == 'push' && steps.ghrelease.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "::warning::softprops 那一步失败了，改用 gh 只补传资源（多半是 release 被 schat.build 先建走了）"
+          shopt -s nullglob
+          files=(dist/Coast-*-linux-*)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::没有可传的产物"; exit 1; }
+          # release 不存在时 gh 会明说 "release not found" —— 那说明连**创建**都没成功，
+          # 与本兜底针对的「已存在但改不动」是两回事，此时红出来是对的。
+          gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null \
+            || { echo "::error::release ${RELEASE_TAG} 根本不存在 —— 不是元数据被拒，是创建失败了"; exit 1; }
+          gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+          echo "补传了 ${#files[@]} 个文件"
 
   # ———————————————————————————————————————————————————————————————————————
   # Android：签名的 release APK。
@@ -2166,6 +2238,9 @@ jobs:
         run: printf '%s\n' "$COMMIT_MSG" > release-notes.md
 
       - name: Upload to GitHub Release
+        id: ghrelease
+        # ★ 失败不直接红：下面那一步会只补传资源。理由见它的注释。
+        continue-on-error: true
         if: (github.event.inputs.publish || github.event.client_payload.publish || 'true') != 'false'
         uses: softprops/action-gh-release@v2
         with:
@@ -2178,6 +2253,39 @@ jobs:
           overwrite_files: true
           files: |
             dist/Coast-*-android-*
+
+      # ★★ 兜底：**只补传资源，一个字段的元数据都不碰。**
+      #
+      #   2026-08-23 实测：如果这条 release 是 schat.build 先建出来的
+      #   （它算版本号用的是 clashauto 分支尖端而不是 trigger 传过去的 tag，
+      #   于是会为一个 Coast 还没构建的 tag 先建好 release，`target_commitish` 是 `main`），
+      #   softprops 接着就会去把 commitish 改成本仓库的 sha，那个 PATCH 被拒：
+      #   `Resource not accessible by integration`。
+      #
+      #   代价大到不成比例：**六个平台的包一个都传不上去**，release 上只剩 4 个 mac DMG，
+      #   而 `manifest` job `needs` 这些平台 → version.json 整份不动 → 所有用户查不到更新。
+      #   实测这样的残缺 release 已经出过三个（v1.1.99 / v1.1.101 / v1.1.104）。
+      #
+      #   ⚠️ 真正的错在 schat.build（本仓库没有推送权限），所以这里不是"修好了"，
+      #   是**别让它连累打包**。`gh release upload` 只调上传资源那个端点，
+      #   不碰 name/body/commitish，因此不受那道拒绝影响。
+      - name: Upload assets (fallback, metadata untouched)
+        if: github.event_name == 'push' && steps.ghrelease.outcome == 'failure'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "::warning::softprops 那一步失败了，改用 gh 只补传资源（多半是 release 被 schat.build 先建走了）"
+          shopt -s nullglob
+          files=(dist/Coast-*-android-*)
+          [ ${#files[@]} -gt 0 ] || { echo "::error::没有可传的产物"; exit 1; }
+          # release 不存在时 gh 会明说 "release not found" —— 那说明连**创建**都没成功，
+          # 与本兜底针对的「已存在但改不动」是两回事，此时红出来是对的。
+          gh release view "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" > /dev/null \
+            || { echo "::error::release ${RELEASE_TAG} 根本不存在 —— 不是元数据被拒，是创建失败了"; exit 1; }
+          gh release upload "${RELEASE_TAG}" "${files[@]}" --clobber --repo "${GITHUB_REPOSITORY}"
+          echo "补传了 ${#files[@]} 个文件"
 
   # ———————————————————————————————————————————————————————————————————————
   # version.json：客户端查更新的唯一数据源，用来绕开 GitHub API 的限流。
