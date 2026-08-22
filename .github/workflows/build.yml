@@ -367,7 +367,7 @@ jobs:
                            'COAST_ARPPARSE_SELFTEST', 'COAST_NICEGRESS_SELFTEST',
                            'COAST_PUBADDR_SELFTEST', 'COAST_REMOTE_SELFTEST',
                            'COAST_MDNS_SELFTEST', 'COAST_PAIRPROTO_SELFTEST',
-                           'COAST_PAIRSERVER_SELFTEST',
+                           'COAST_PAIRSERVER_SELFTEST', 'COAST_ADVERTISE_SELFTEST',
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
                            'COAST_TCPREAP_SELFTEST', 'COAST_TIDE_SELFTEST',
@@ -1346,6 +1346,11 @@ jobs:
           # 显示的那个码解开，再验限流、404、收摊。
           # ⚠️ 没有可加组播的接口时（容器里常见）它明说 SKIP —— 那是环境，不是被测对象。
           run_selftest COAST_PAIRSERVER_SELFTEST
+          # 地址跟随的常驻宣告：指纹、TXT 拼装与取值。
+          # ★ 最要紧的两条是「广播里没有公钥、没有口令」——那条广播是常驻的，
+          #   泄露一次就等于把配对整个绕过去了。
+          # ⚠️ 真凭据那一段要可执行的核心（COAST_ADVERTISE_CORE），CI 上没有，明说 SKIP。
+          run_selftest COAST_ADVERTISE_SELFTEST
           run_selftest COAST_TIDE_SELFTEST
           # 老模板迁移：它动的是**用户已经存在的**配置与台账。搬错一条 = 用户自己加的规则没了；
           # 漏改一处组名 = 规则指向不存在的组，核心拒绝**整份配置**，所有人的代理都起不来。
