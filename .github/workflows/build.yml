@@ -397,7 +397,7 @@ jobs:
                            'COAST_MDNS_SELFTEST', 'COAST_PAIRPROTO_SELFTEST',
                            'COAST_PAIRSERVER_SELFTEST', 'COAST_ADVERTISE_SELFTEST',
                            'COAST_PAIRSESSION_SELFTEST', 'COAST_PAIRECDH_SELFTEST',
-                           'COAST_QMLLOAD_SELFTEST',
+                           'COAST_QMLLOAD_SELFTEST', 'COAST_REMOTECLIENTS_SELFTEST',
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
                            'COAST_TCPREAP_SELFTEST', 'COAST_TIDE_SELFTEST',
@@ -1525,6 +1525,12 @@ jobs:
           #   ⚠️ `qml_positioner_check.py` 是静态近似（只判一种），这条是真加载。
           #   变异验证过两次都会红：布局直接子项加 anchors、绑定里调不存在的方法。
           run_selftest COAST_QMLLOAD_SELFTEST 120
+          # 远程接入的客户端台账：每台配对过的手机一份独立凭据。
+          # ★ 在此之前所有手机共用一个 tide 用户 —— 分不出谁在线，想撤销其中一台
+          #   只能换掉共用口令，**把所有手机一起踢下线**。台账里最要紧的两条断言是
+          #   「两台的用户名与口令都不同」和「旧版那份共用凭据被收进来且保持启用」
+          #   （后者漏了的话，升级之后已经配对的手机会突然连不上，零提示）。
+          run_selftest COAST_REMOTECLIENTS_SELFTEST
           # 配对第 2 版的派生层：ECDH 共享密钥 → 对称密钥 + 6 位显示码。
           # ★ 那份跨线固定向量挡的是「两边算出的码不一样」——而那个现象
           #   **看起来像中间人攻击**，是这套东西最不该出的误报。
