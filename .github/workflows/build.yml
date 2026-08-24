@@ -267,6 +267,11 @@ jobs:
       #   ★ 同样先跑自检：抹掉一个真实消费端，确认门禁会红。
       - run: python3 ios/scripts/settings_consumer_check.py --selftest
       - run: python3 ios/scripts/settings_consumer_check.py
+      # ★ 「进了二级页却没退出来就点底栏」的静态判据。二级页隐藏底栏，那一下会报
+      #   「No matches found for TabBar」——读起来像底栏坏了。这类回归 CI 抓不到
+      #   （iOS 的 UI 用例要模拟器，macOS 那条腿只跑 swift test），所以静态判一道。
+      - run: python3 ios/scripts/uitest_subpage_check.py --selftest
+      - run: python3 ios/scripts/uitest_subpage_check.py
       # ★ DMG 版式的几个数字散在三个文件里（make_dmg.sh 的窗口/图标、背景图生成器的
       #   尺寸与凹槽、以及入库的那张 PNG），必须一起动。改了其中一个而没改另外两个，
       #   后果是「图标不在凹槽里」或「背景被 Finder 按像素铺、只盖半扇窗」——
