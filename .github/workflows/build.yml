@@ -96,7 +96,272 @@ env:
 #    只能动态链，所以 .deb 仍有一串 Depends（但 Qt 自己一个都不占了）。
 
 jobs:
+  gates:
+    name: 门禁（全部纯 Python，秒级）—— 不过就不开始打包
+    runs-on: ubuntu-latest
+    steps:
+      # ★ `fetch-depth: 0` 是必须的，不是保险起见：`version_consistency_check.py`
+      #   要验「`.github/version-base` 里那个基线 sha 确实在本仓库历史里」，
+      #   而默认的浅克隆只有一个 commit —— 基线必然不在，门禁**恒红**。
+      #   ⚠️ 它红的样子极具误导性：「110d4db 不是本仓库的 commit」，
+      #   读起来像是基线写错了，而基线是对的、错的是克隆深度。
+      #   2026-08-22 因此红了四轮。
+      # ★★ 写成 `- name:` + `uses:` 而**不是**裸 `- uses:` —— 生成器改写 checkout 时，
+      #   裸写法那条规则会在后面直接插一个 `with:`，若本步骤自己也带 `with:`（这里的
+      #   fetch-depth），产物就会出现**两个 with 键**，后者把 repository/ref/token 整个
+      #   覆盖掉：gates 于是在 Coast 自己的空仓库上跑门禁，脚本全都找不到源码，
+      #   六平台永远等不到它变绿 —— 打包彻底停摆。2026-08-24 加这个 job 时当场踩到。
+      #   （生成器那侧也已加断言，见 gen_coast_workflow.py 的 bare+with 检查。）
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ env.SOURCE_SHA || env.SOURCE_REF }}
+          token: ${{ secrets.SOURCE_TOKEN || github.token }}
+          fetch-depth: 0
+      - run: python3 clashauto-c++/scripts/check_misleading_indent.py
+      # Qt 线的 i18n 门禁。Swift 线早就有一份，本线一直没有 —— 而它挡的是**静默**失效：
+      # qsTr 的串不在语言表里时，Qt 退回源串，于是 11 种语言全显示中文、零报错，
+      # 而开发机上完全看不出来（开发者用的就是中文）。第一次跑就找出 3 条漏译。
+      # 放在这条腿上：纯 Python，不需要任何构建产物，几秒钟出结果。
+      - run: python3 clashauto-c++/scripts/i18n_check.py
+      # ★ `$var` 后面紧跟中文标点 —— macOS 自带的 bash 3.2 在 UTF-8 locale 下会把那个
+      #   多字节字符吞进变量名，set -u 当场 `unbound variable`。只在 mac 上、只在
+      #   UTF-8 locale 下、且只在那一行真被执行到时才炸，所以在开发机上 ssh 跑一遍
+      #   （LANG 通常是空的）根本验不出来 —— 2026-08-12 就是这么放过去一次的。
+      - run: python3 clashauto-c++/scripts/shell_multibyte_check.py
+      # ★★ 工作流里的 shell 是**纯文本**：少一个引号、少一个 `fi`，YAML 依然合法、
+      #   所有 YAML 层面的检查依然全绿 —— 只有那个 job 真跑起来才炸，而那要一整轮 CI。
+      #   ⚠️ 报错的行号还是**临时脚本内部**的行号，与工作流文件对不上，
+      #   而作业日志要仓库 admin 权限才看得到。2026-08-22 macOS Qt 那条腿就因为
+      #   `echo "…（COAST_OPENSSL_LINKS=1）` 少了个右引号连红两轮，而红的表象是
+      #   「Configure 失败」—— 看起来完全像 CMake 的问题。
+      #   这个脚本对每段 bash run 跑 `bash -n`（只解析、不执行），并把行号换算回工作流文件。
+      - run: python3 clashauto-c++/scripts/workflow_shell_check.py --selftest
+      - run: python3 clashauto-c++/scripts/workflow_shell_check.py
+      # ★ 定位器（Row/Column/Grid/Flow）的**直接子项**写了被禁的 anchors。Qt 的反应不是
+      #   忽略那一条，而是让**整个定位器停止排版**（"Row will not function"）：子项全部
+      #   堆到原点，而且那条 anchors 自身也不生效 —— MouseArea 会变成 0×0，那块**点不动**。
+      #   构建期零信号；运行期只有该组件真被实例化时才打一行警告，开发机上很容易一直看不见。
+      #   2026-08-10 实测：出货的 v1.0.1143 里 ConfirmOverlay 的「5 分钟内不再询问」勾选框
+      #   就是这样既错位又点不动的，是从 validate 的无头运行日志里翻出来的。
+      #   ★ 先跑它自己的自检：第一版是**按行**扫的，单行写法
+      #     `MouseArea { anchors.fill: parent }` 整个不可见 —— 合成用例里三条该命中的一条都
+      #     没抓到，只因真实那处碰巧是多行才显得能用，还就这么进了 CI。只在特定排版下生效的
+      #     门禁比没有门禁更危险：它让人以为这一类已经被挡住了。
+      - run: python3 clashauto-c++/scripts/qml_positioner_check.py --selftest
+      - run: python3 clashauto-c++/scripts/qml_positioner_check.py clashauto-c++/qml clashauto-c++/installer/ui/qml
+      # ★ 「算版本号」那段在每个 job 里各有一份，必须逐字一致。不一致 = 同一个 commit
+      #   算出两个 tag：产物传到 A，trigger-mac 通知 schat.build 发到 B，两边 CI 全绿而
+      #   release 是劈开的（2026-08-10 实测劈过一次）。2026-08-11 又发现 macos-swift 那份
+      #   漏了 minor 兜底，而它的注释还写着「口径与 windows/linux job 完全一致」——
+      #   这种事人眼核对不可靠。
+      - run: python3 clashauto-c++/scripts/version_recipe_check.py
+
+      # 版本号口径：四处各写一遍的东西（CMakeLists / android / version-base /
+      # release.yml 的六段算法），漏改一处不会报错，只表现为「两端算出不同的版本号」。
+      - run: python3 clashauto-c++/scripts/version_consistency_check.py --selftest
+      - run: python3 clashauto-c++/scripts/version_consistency_check.py
+      # ★ 同一个主题的另一处「N 份拷贝必须一致」：地区分组表在 Qt / Swift / Android 各写一份。
+      #   CLAUDE.md 一直写着「逐字相同，改一处要改三处」，而这句话在 2026-08-13 之前**是假的** ——
+      #   桌面两条线是 `Auto - HK`，Android 那份是 `♻️ 香港`，地区集合也各不相同。
+      #   漂了之后零报错：组名会原样落进规则第三段、REST API 和日志里，于是同一份订阅在手机上
+      #   和桌面上生成出不同的组名，用户照桌面文档写的规则在手机上一条都不命中，
+      #   而两边的配置各自都合法、核心都正常启动。三份正则连语法都不一样，人眼核对不可靠。
+      #   顺带钉住：组名必须纯 ASCII（emoji 组名要走 YAML \U 转义那条路，四条线各一份解码器）、
+      #   两位国家码必须带非字母边界（不带则 US 命中 R(us)sia、DE 命中 Swe(de)n）、
+      #   以及种子里那五个基础组的**顺序**（三条线都按位置填充，插中间 = 节点写进错组且零报错）。
+      #   ★ 光判「三条彼此一致」是不够的：三条**一起**改错时它全绿，而那正是最可能的改法
+      #     （有人觉得 `HKG?` 是笔误，三处一起"修"成 `HK`，IATA 码就此漏判）。所以还带一份
+      #     语料回归：41 条真实机场命名法的正例 + 13 条「去掉边界就会误命中」的反例
+      #     （Russia/Ukraine/Sweden/Malaysia…），钉的是**行为**不是一致性。
+      #   ★ 先跑自检：这道门禁最典型的坏法是正则失配后三条线都解析出 0 条、于是「一致」而通过 ——
+      #     空转的门禁比没有门禁更危险。自检里专门有一条合成用例钉这个，另有两条把真实的表
+      #     故意改坏（去边界 / 去第三位字母）来确认语料真的抓得住。
+      - run: python3 clashauto-c++/scripts/region_table_check.py --selftest
+      - run: python3 clashauto-c++/scripts/region_table_check.py
+      # 配对界面的位置：四条线上配对全程都必须住在管理/我的电脑那一页，
+      # 设置页只留一行入口。判据取两侧 —— 只判"管理页上有"的话，
+      # "两边各留一份"这种最容易发生的改法照样通过。
+      - run: python3 clashauto-c++/scripts/pairing_placement_check.py --selftest
+      - run: python3 clashauto-c++/scripts/pairing_placement_check.py
+      # 配对协议的跨线固定向量：四条线必须钉同一份。
+      # ★ Qt 那份在 COAST_PAIRPROTO_SELFTEST 里，由**打包流水线**跑，不在这条腿上 ——
+      #   打包一停（比如 Actions 额度耗尽）它就没人验了。这道门禁不执行密码学，
+      #   但不用构建任何东西就能判出「有人改了其中一条线的向量」。
+      - run: python3 clashauto-c++/scripts/pair_kat_check.py --selftest
+      - run: python3 clashauto-c++/scripts/pair_kat_check.py
+      # 四条线的订阅节点解析必须留着那四条回归用例（展开式列表 / 嵌套列表项 /
+      #   块式嵌套不压平 / hysteria2 的 `ports:` 区间）。
+      #   2026-08-20 真机事故：一份 56 节点的订阅被解析成 10 个、字段压平并重复十几遍
+      #   → `full.yaml` 出现重复键 → 核心**拒绝整份配置** → 代理根本起不来，全程零报错。
+      #   四条线是互相 1:1 移植的，缺陷当时**同时**存在于四条线，人眼比对四种语言不可靠。
+      #   ★ 先跑自检：它会确认判据在完整夹具上全中、在残缺夹具上真的会红 ——
+      #     这道门禁最典型的坏法是判据写空、四条线都"通过"。
+      #   ⚠️ 它只查「用例还在不在」，不查「解析器对不对」：后者由各线自己的测试跑
+      #     （Qt 没有测试框架，走 COAST_SUBYAML_SELFTEST）。
+      - run: python3 clashauto-c++/scripts/subparse_check.py --selftest
+      - run: python3 clashauto-c++/scripts/subparse_check.py
+      # ★ `QString::arg()` 每次只替换**当前串里编号最小**的 `%N` —— 于是链式
+      #   `.arg(a).arg(b)` 中 a 填进去的内容会被 b 再看一遍。百分号编码的值撞上这一点
+      #   必然出事：组名 "HK/01" 编码成 `HK%2F01`，`%2F` 被后一个 arg 当成占位符替换掉，
+      #   测速 URL 变成 `/proxies/HK5000F01/speed?timeout=<那个URL>&url=%5` —— 组名被
+      #   改写、超时槽错位、`%5` 压根没替换。编译期零信号、运行期不报错，只是测速对不上号。
+      #   （空格编码成 `%20` 反而没事：Qt 按两位数读成占位符 20，大于剩余编号。正因为只在
+      #   部分字符上发作，肉眼 review 抓不住，才值得上门禁。）
+      - run: python3 clashauto-c++/scripts/arg_chain_check.py --selftest
+      - run: python3 clashauto-c++/scripts/arg_chain_check.py clashauto-c++/src clashauto-c++/installer
+      # ★ 同一个 `.arg()` 的**另一半**：占位符个数与实参个数对不上。两个方向都不报错 ——
+      #   实参少了，没被替换的 `%2` 原样显示给用户；实参多了，那个值**静默丢弃**。
+      #   编译期零信号（.arg() 接受任意条链式调用），运行期不抛不警，只能靠看，
+      #   而串一长、`.arg()` 一换行就看不出来了。
+      #   与 i18n_check 的占位符检查合起来才闭环：那边管「译文与源串一致」，这边管
+      #   「源串与调用方一致」。只有前者的话，源串本身就少给一个实参时，12 种语言会
+      #   一起显示 `%2`。加进来时全库实测 0 处违规 —— 补缺口，不是修现行故障。
+      - run: python3 clashauto-c++/scripts/arg_count_check.py --selftest
+      - run: python3 clashauto-c++/scripts/arg_count_check.py clashauto-c++/src clashauto-c++/installer clashauto-c++/qml
+      # ★ 自检钩子「注册了就必须有人跑，除非写明为什么不跑」。
+      #   本项目没有单测框架，全靠这组钩子；而它们的价值完全取决于有没有进门禁 ——
+      #   实测发生过：MANIFEST/SETTINGS/SUBS/HISTORY/DEVICEDB/CONNSTATS 六个纯逻辑、
+      #   秒级、无网络的钩子写好之后**一次都没被 CI 跑过**，靠人工逐个 grep 才发现。
+      #   人工核对不可靠，所以固定成脚本；豁免必须连理由一起写在脚本里。
+      - run: python3 clashauto-c++/scripts/selftest_coverage_check.py
+      # ★ 上一条管「注册了的必须有人跑」，这一条管**反过来**：CI 某条腿点名要跑的钩子，
+      #   必须在那条产品线上真的注册过。少了它的代价实测过：macos-swift 腿的名单里混进了
+      #   COAST_LOGROUTE_SELFTEST（Qt 独有），于是那条腿每轮都 exit=2 必然红，而
+      #   `swift test` 其实 495 个测试全过 —— 真正的信号被一个名单错误整个盖住。
+      - run: python3 clashauto-c++/scripts/selftest_ci_lists_check.py
+      # ★ 上面那条只查「名单里的名字对不对」，查不出**名单本身被写坏**。2026-08-12 实测：
+      #   mac 那条腿的 `for t in … \<换行> …` 被写成了一行里的字面 `\n`，于是 bash 的词表里
+      #   凭空多出一项叫 `n` 的「钩子」。没有 if 认领它 = GUI 起来不退 = 30 秒后被打死，
+      #   报错是「n 30 秒未退出」，而真正要跑的那个钩子一次都没跑。上一条门禁照样绿
+      #   （它按 `COAST_\w+_SELFTEST` 取名字，`n` 在它眼里根本不存在）。
+      - run: python3 clashauto-c++/scripts/flattened_continuation_check.py
+      # ★ 生成物必须与生成器的输出逐字一致。`installer/core/NativeStrings.h` 是
+      #   13 语言 × 25 句 = 325 格的生成表，文件头自己写着「本文件是生成的」——
+      #   而此前**没有任何东西在检查这件事**。手改一格或改了生成器忘了重跑，编译期
+      #   毫无征兆，运行期只表现为「某种语言下这句话串成了另一句」，且**只有装在那个
+      #   语种的机器上才看得见**（开发机与 runner 都是中文/英文，永远不命中）。
+      - run: python3 clashauto-c++/scripts/generated_files_check.py
+      # ★ iOS 线（第四条产品线）的两道源码门禁。纯 Python，不需要 Mac、不需要构建产物。
+      #   ① 1:1 审计：Android 界面上有的每一句话，iOS 要么有、要么在脚本的 DELIBERATE 里
+      #      写明为什么没有（反向还判死豁免 —— 写了理由但 iOS 其实已经有了的条目必须删掉，
+      #      否则它会掩盖以后真的把那句话删掉的改动）。这条产品线的要求就是「严格按 Android
+      #      1:1 复制」，而漏掉一句话的表现极其温和：界面照样能用，只是少了一个提示、
+      #      一个状态、或者一条校验。第一次跑就找出两处真缺口（延迟 0 显示成「0 ms」而不是
+      #      「超时」；端口越界默默弹回、一个字的解释都没有）。
+      - run: python3 ios/scripts/audit_1to1.py
+      #   ② 工程不变量：App Group 标识（entitlements ↔ AppPaths.swift 两处必须一致，
+      #      对不上就静默退回 app 沙箱 —— 界面全对而隧道读不到配置）、三个构建阶段
+      #      （语言表 / 种子 / 版本戳，缺了分别是「12 种语言退回中文」「full.yaml 什么都没有」
+      #      「查更新恒说有新版」）、种子清单与 Seed.yamlNames 一致、Info.plist 的位置。
+      #      每一条的失败形态都是**编得过、跑得起来、只是悄悄不对**。
+      #   ★ 先跑自检：七条不变量分别改坏一次，确认门禁真的会红 —— 空转的门禁比没有更危险。
+      - run: python3 ios/scripts/project_check.py --selftest
+      - run: python3 ios/scripts/project_check.py
+      #   ③ 配置项必须有**消费端**。判据来自一次真实缺陷（Android 的「跟随系统深浅色」
+      #      有开关、有落盘、重启还在，却没有任何控件写 theme）：设置项的价值不在
+      #      「存没存住」而在**谁读它**。写了没人读 = 开关是假的；读了没人写 = 永远走默认值。
+      #      两种都零报错，也都不会被任何测试自然覆盖。本线用它抓到过两个
+      #      （切换节点时断开连接、订阅自动更新周期，都是"存得住、翻得动、没人读"）。
+      #   ★ 同样先跑自检：抹掉一个真实消费端，确认门禁会红。
+      - run: python3 ios/scripts/settings_consumer_check.py --selftest
+      - run: python3 ios/scripts/settings_consumer_check.py
+      # ★ DMG 版式的几个数字散在三个文件里（make_dmg.sh 的窗口/图标、背景图生成器的
+      #   尺寸与凹槽、以及入库的那张 PNG），必须一起动。改了其中一个而没改另外两个，
+      #   后果是「图标不在凹槽里」或「背景被 Finder 按像素铺、只盖半扇窗」——
+      #   而这在**任何 CI 里都看不见**：打包照样成功，只有把 dmg 双击开来才发现，
+      #   可用户每次下载都会看到。
+      - run: python3 clashauto-c++/scripts/dmg_layout_check.py
+      # ★ 两条产品线写的是**同一个 coast.db**（configDir/coast.db）。于是「保留多久」
+      #   「最多存几条」这几个数一旦两边不一样，先跑的那条会按自己的口径删掉另一条
+      #   认为还该留的数据 —— 用户给设备设的代理开关/策略/备注名，或者一段连接历史，
+      #   就这么没了，且不可逆、界面上只表现为「不见了」。
+      #   只有同时装了两条线的 mac 用户会遇到，开发机与 runner 都只跑其中一条。
+      - run: python3 clashauto-c++/scripts/shared_db_constants_check.py
+      # ★ Windows 透明网关的 TCP 数据面是 Rust 静态库，C++ 按 src/net/coaststack.h
+      #   的声明去调它。这个边界**两边各自都能编过**，链接期也未必报错，签名对不上
+      #   只在运行期以 UB 现形（拿整数当指针解引用、少读一个参数）。而这条路是
+      #   每个被代理设备的每条 TCP 连接都要走的。只查存在性与参数个数，不比类型。
+      - run: python3 clashauto-c++/scripts/rust_abi_check.py
+      # ★ 同一个 crate 是 `panic = "abort"` 的（panic 跨 FFI 边界是 UB），代价写在
+      #   Cargo.toml 里：Rust 侧一旦 panic **整个 Qt GUI 进程当场消失** —— 不是
+      #   「网关不可用」，是 app 没了。那段注释因此立了一条硬约束「FFI 边界必须
+      #   零 unwrap/零 panic」，还记着一次事故（NAT 表 bind().unwrap() 遇 EMFILE
+      #   直接 core dump）。而在这道门禁之前没有任何东西在检查它：加一个 unwrap
+      #   编译期毫无征兆，跑起来也多半没事，直到那条 Result 真的是 Err。
+      - run: python3 clashauto-c++/scripts/rust_no_panic_check.py
+      # ★ 控制面「方法名 + **风险档**」两条线必须逐条一致。
+      #   两条线各自的 `ControlApi::runSelfTest` 已经比对方法名清单了，但那份清单**不含
+      #   风险档** —— 于是把 `rules.add` 从 policy 降成 reversible 这种改动，两边自检
+      #   全绿、MCP 客户端配置也不用改，只有行为变了：同一条 AI 加的规则，Windows 上
+      #   弹卡片等确认，macOS 上直接就改了。风险档是这套东西的安全边界，不是文档。
+      - run: python3 clashauto-c++/scripts/control_risk_check.py --selftest
+      - run: python3 clashauto-c++/scripts/control_risk_check.py
+      # ★ Android 的 `AppConfig` 字段必须有人读，**界面上给了开关的尤其**。
+      #   同一类缺陷在一轮里连着抓到六个（ipv6 / autoUpdate / receiveBeta /
+      #   clearConnections / nodeOnlyAvailable / keepRunningInBackground）：设置存得住、
+      #   开关翻得动、**没有任何人读它**，零报错。手工查一次不难，难在它会再长回来 ——
+      #   加一个开关只要两行，接后端要另外找地方，很容易只做前一半就收工。
+      - run: python3 android/scripts/config_consumer_check.py
+      # ★ app 侧的告警必须走 CoastLog：`Log.w`/`Log.e` 只进 logcat，而**普通用户没有
+      #   logcat**。于是那些刻意加的诊断在真实使用形态下恰恰是静默的 —— 与桌面端
+      #   「qWarning 去的 stderr 谁也看不见」是同一件事。CoastLog 两边都写。
+      - run: python3 android/scripts/log_visibility_check.py
+      # ★ Android 界面的 i18n。挡的是**完全静默**的失效：表里缺一条时 `I18n.tr` 直接
+      #   返回原串 —— 11 种语言全显示中文、零报错，而开发者自己用中文永远看不出来。
+      #   新写的界面串忘了包 `tr()` 同理：编译过、跑起来正常，只是那一句永远不翻。
+      - run: python3 android/scripts/i18n_check.py
+      # ★★ mac 线的 i18n 门禁**原本只跑在 macOS Swift 那条腿上**（build+test 之后的一步），
+      #   于是它抓到的漏译要等四分钟编译才现形，而且是在一台按 10 倍率计费的 runner 上。
+      #   它是纯 Python、只扫源码，放这里等价且快 100 倍。2026-08-24 实测：
+      #   `.t` 贴在三元结果上（`(armed ? "A" : "B").t`）被它抓红，而那一轮六平台已经开跑。
+      - run: python3 macos/scripts/i18n_check.py
+      # ★★ `android/core` 是**纯 JVM 模块**（刻意的：没有设备也能 `:core:test`），
+      #   于是它掉进一个结构性盲区 —— Kotlin 按 JDK 17 判 API 存不存在（编得过）、
+      #   单测跑在桌面 JVM 上（全绿）、Android Lint 的 NewApi 只扫 Android 模块
+      #   （看不见这里）。超出 minSdk 的 JDK API 要到真机上才 NoSuchFieldError，
+      #   而那多半被 `runCatching` 吞掉，**连崩溃都没有**，只表现为「这个功能
+      #   在手机上什么都不做」。2026-08-22 的 `BigInteger.TWO` 就是这样让整个
+      #   配对的 ECDH 恒返回 null 的：桌面端收得到握手、手机界面毫无反应。
+      - run: python3 android/scripts/core_api_level_check.py --selftest
+      - run: python3 android/scripts/core_api_level_check.py
+      # 安装器原生侧那张语言表（25 句 × 13 语言 = 325 格）是**生成物**。生成物的经典
+      # 隐患是有人直接手改产物：改动能编、能跑、能过自检，然后下一次跑生成器时被
+      # **静默还原** —— 而那时改的人早忘了这回事，只会看到「我明明改过的文案又变回去了」。
+      # 所以重跑一遍生成器，断言工作树没有任何变化。
+      - name: NativeStrings.h 与生成器一致
+        run: |
+          python3 clashauto-c++/scripts/gen_native_strings.py
+          if ! git diff --exit-code -- clashauto-c++/installer/core/NativeStrings.h; then
+            echo "::error::NativeStrings.h 与 scripts/gen_native_strings.py 的产物不一致 —— \
+          它是生成物，改文案要改生成器再重新生成，别直接改头文件"
+            exit 1
+          fi
+
+  #
+  # ★ 通知 ClashrAuto/Coast 构建同一个分支。发布入口已经搬到 Coast，而那边没有源码 ——
+  #   它的 build.yml 监听 `repository_dispatch: types: [build]`，就是等这一条告诉它
+  #   「构建哪个 ref」。
+  # ★ 不发的话会出一种很难归因的残缺：本仓库推一次 → `trigger-mac` 让 schat.build 把签名
+  #   DMG 传到 **Coast**，而 Coast 从来没构建过那个 tag —— 于是 Coast 上冒出一个
+  #   「只有两个 DMG、没有任何 Windows/Linux 包」的 release；如果推的是 master，它还是
+  #   正式版，会当场抢走 latest。2026-08-10 实测出现过三个这样的 tag。
+  # ⚠️ **payload 里必须传分支名，不能传 sha**：Coast 那侧用 `SOURCE_REF` 是不是
+  #   `master`/`main` 来判正式版，传 sha 的话每一轮都会被判成 beta。
+  # ⚠️ `GITHUB_TOKEN` 只对本仓库有效，跨仓库 dispatch 必须用 PAT：
+  #   COAST_DISPATCH_TOKEN —— 对 ClashrAuto/Coast 有 contents:write 的 PAT。
+  #   未配置时只打 warning 跳过（不失败）—— 但那等于整条 Coast 打包链没有被触发。
+  # ★★ iOS 线在此之前**一个编译/测试 job 都没有** —— 只有三个静态门禁在扫源码。
+  #   于是 `ios/CoastCore` 那 400 多条测试和整个 app 的可编译性在 CI 上是盲区：
+  #   一次改坏要等到有人打开 Xcode 才发现，而这条线的验证路径本来就是"某台 Mac 上手跑"。
+  #   （本仓库为同一类盲区补过 `android/core` 的 API level 门禁，见那边的说明。）
+  #
+  # ⚠️ iOS **不进打包流水线** —— 它不出 release 产物，所以这个 job 放在源码门禁这条
+  #   工作流里，而不是 release.yml。
+
   windows:
+    needs: gates
     name: Windows ${{ matrix.arch }}
     runs-on: windows-2022
     strategy:
@@ -898,6 +1163,7 @@ jobs:
           echo "补传了 ${#files[@]} 个文件"
 
   macos:
+    needs: gates
     name: macOS universal Qt (x86_64 + arm64)
     # ★★ 2026-08-02 重新启用：mac 上 **两条腿并存**，用户在 release 里二选一。
     #      · Swift 版（macos-swift job）—— 部署目标 macOS 26，整套界面建在 Liquid Glass 上，
@@ -1355,6 +1621,7 @@ jobs:
       #   还找不到原因。所以宁可这里什么都不传。
 
   linux:
+    needs: gates
     name: Linux ${{ matrix.arch }}
     runs-on: ${{ matrix.runner }}
     strategy:
@@ -2088,6 +2355,7 @@ jobs:
   #   · 产物是**一个** universal APK（三个 ABI 都在里面），不切 split。侧载场景下让
   #     用户自己挑 ABI 是道必然有人挑错的选择题，而挑错的表现是「装上了打不开」。
   android:
+    needs: gates
     name: Android
     runs-on: ubuntu-22.04
     steps:
@@ -2602,6 +2870,7 @@ jobs:
   # 两边的一键更新各认各的（UpdateChecker.isQtLine / UpdateController::recommendedIndex），
   # 早先「两个同名 macOS 包落在同一 release、老版本挑到哪个纯看运气」的问题由此消解。
   macos-swift:
+    needs: gates
     name: macOS (Swift) build + test
     # ★ 必须是带 **SDK 26** 的镜像：Package.swift 的部署目标是 macOS 26。
     #   镜像更旧的话 swift build 会在「'v26' is unavailable / SDK 不支持」上失败——
