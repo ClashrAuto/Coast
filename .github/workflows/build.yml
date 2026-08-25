@@ -327,6 +327,11 @@ jobs:
       #   于是它抓到的漏译要等四分钟编译才现形，而且是在一台按 10 倍率计费的 runner 上。
       #   它是纯 Python、只扫源码，放这里等价且快 100 倍。2026-08-24 实测：
       #   `.t` 贴在三元结果上（`(armed ? "A" : "B").t`）被它抓红，而那一轮六平台已经开跑。
+      # ★ Swift 线的 NWListener 一律用临时端口。2026-08-25 实报：地址宣告为了挂
+      #   Bonjour 服务绑走了远程接入端口 18443，核心的 tide 监听从此
+      #   `address already in use` —— 而就绪自检只看"端口有没有人在听"，桌面全绿。
+      - run: python3 macos/scripts/listener_port_check.py --selftest
+      - run: python3 macos/scripts/listener_port_check.py
       - run: python3 macos/scripts/i18n_check.py
       # ★★ `android/core` 是**纯 JVM 模块**（刻意的：没有设备也能 `:core:test`），
       #   于是它掉进一个结构性盲区 —— Kotlin 按 JDK 17 判 API 存不存在（编得过）、
