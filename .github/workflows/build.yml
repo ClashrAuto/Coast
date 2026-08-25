@@ -185,6 +185,12 @@ jobs:
       # "两边各留一份"这种最容易发生的改法照样通过。
       - run: python3 clashauto-c++/scripts/pairing_placement_check.py --selftest
       - run: python3 clashauto-c++/scripts/pairing_placement_check.py
+      # ★ 跑嵌套事件循环（QMessageBox::exec 等）的 Q_INVOKABLE 必须返回 void。
+      #   2026-08-25 实报的返工：返回 bool 让 QML 写成「先问、再act」，而弹框那几秒里
+      #   列表被刷新、委托重建，第二步读到的 modelData 已失效 —— 表现为"删不掉"，
+      #   且只在有手机在线时才发作。那一版通过了两个自检和全部门禁。
+      - run: python3 clashauto-c++/scripts/modal_reentrancy_check.py --selftest
+      - run: python3 clashauto-c++/scripts/modal_reentrancy_check.py
       # 配对协议的跨线固定向量：四条线必须钉同一份。
       # ★ Qt 那份在 COAST_PAIRPROTO_SELFTEST 里，由**打包流水线**跑，不在这条腿上 ——
       #   打包一停（比如 Actions 额度耗尽）它就没人验了。这道门禁不执行密码学，
