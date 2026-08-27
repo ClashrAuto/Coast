@@ -405,6 +405,22 @@ jobs:
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
           fetch-depth: 0
 
+      # ★★ 把四条线共用的 GeoIP 种子换成**最新**那份。**必须在构建之前** ——
+      #   Qt 走 qrc、Swift 走 Resources、Android 靠 gradle 把 `assets/bundle` 挂成
+      #   assets 源目录、iOS 靠 pbxproj 的拷贝阶段，全都是**构建时**读进去的。
+      #   ⚠️ 入库那份是 2022-09-08 的：它是个二进制，谁也不会想起来去更新它，
+      #   而全新安装的用户拿到的就是它。拿它和 2026-08-20 那份对 6 万个随机公网
+      #   IPv4 逐个查，7.44% 判定不同，其中 1.6% 是「旧库判 CN、实际已不是 CN」——
+      #   那一档会被错误直连，是断网方向。
+      #   ★ 下载失败**当场判红**，与「Bundle latest stable core」同一个理由：
+      #   「包里带一份四年前的 GeoIP」是静默劣化，出货之后没有任何人看得见。
+      #   （存量用户不靠这一步 —— 四条线现在都有运行期的 GeoIP 自动更新。）
+      - name: Bundle latest GeoIP
+        shell: bash
+        run: |
+          PY=python3; command -v $PY >/dev/null 2>&1 || PY=python
+          "$PY" clashauto-c++/scripts/fetch_geoip.py
+
       - name: Resolve build version
         shell: pwsh
         run: |
@@ -1201,6 +1217,22 @@ jobs:
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
           fetch-depth: 0
 
+      # ★★ 把四条线共用的 GeoIP 种子换成**最新**那份。**必须在构建之前** ——
+      #   Qt 走 qrc、Swift 走 Resources、Android 靠 gradle 把 `assets/bundle` 挂成
+      #   assets 源目录、iOS 靠 pbxproj 的拷贝阶段，全都是**构建时**读进去的。
+      #   ⚠️ 入库那份是 2022-09-08 的：它是个二进制，谁也不会想起来去更新它，
+      #   而全新安装的用户拿到的就是它。拿它和 2026-08-20 那份对 6 万个随机公网
+      #   IPv4 逐个查，7.44% 判定不同，其中 1.6% 是「旧库判 CN、实际已不是 CN」——
+      #   那一档会被错误直连，是断网方向。
+      #   ★ 下载失败**当场判红**，与「Bundle latest stable core」同一个理由：
+      #   「包里带一份四年前的 GeoIP」是静默劣化，出货之后没有任何人看得见。
+      #   （存量用户不靠这一步 —— 四条线现在都有运行期的 GeoIP 自动更新。）
+      - name: Bundle latest GeoIP
+        shell: bash
+        run: |
+          PY=python3; command -v $PY >/dev/null 2>&1 || PY=python
+          "$PY" clashauto-c++/scripts/fetch_geoip.py
+
       - name: Resolve build version
         shell: bash
         run: |
@@ -1662,6 +1694,22 @@ jobs:
           ref: ${{ env.SOURCE_SHA || env.SOURCE_REF }}
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
           fetch-depth: 0
+
+      # ★★ 把四条线共用的 GeoIP 种子换成**最新**那份。**必须在构建之前** ——
+      #   Qt 走 qrc、Swift 走 Resources、Android 靠 gradle 把 `assets/bundle` 挂成
+      #   assets 源目录、iOS 靠 pbxproj 的拷贝阶段，全都是**构建时**读进去的。
+      #   ⚠️ 入库那份是 2022-09-08 的：它是个二进制，谁也不会想起来去更新它，
+      #   而全新安装的用户拿到的就是它。拿它和 2026-08-20 那份对 6 万个随机公网
+      #   IPv4 逐个查，7.44% 判定不同，其中 1.6% 是「旧库判 CN、实际已不是 CN」——
+      #   那一档会被错误直连，是断网方向。
+      #   ★ 下载失败**当场判红**，与「Bundle latest stable core」同一个理由：
+      #   「包里带一份四年前的 GeoIP」是静默劣化，出货之后没有任何人看得见。
+      #   （存量用户不靠这一步 —— 四条线现在都有运行期的 GeoIP 自动更新。）
+      - name: Bundle latest GeoIP
+        shell: bash
+        run: |
+          PY=python3; command -v $PY >/dev/null 2>&1 || PY=python
+          "$PY" clashauto-c++/scripts/fetch_geoip.py
 
       - name: Resolve build version
         shell: bash
@@ -2383,6 +2431,22 @@ jobs:
           token: ${{ secrets.SOURCE_TOKEN || github.token }}
           fetch-depth: 0
 
+      # ★★ 把四条线共用的 GeoIP 种子换成**最新**那份。**必须在构建之前** ——
+      #   Qt 走 qrc、Swift 走 Resources、Android 靠 gradle 把 `assets/bundle` 挂成
+      #   assets 源目录、iOS 靠 pbxproj 的拷贝阶段，全都是**构建时**读进去的。
+      #   ⚠️ 入库那份是 2022-09-08 的：它是个二进制，谁也不会想起来去更新它，
+      #   而全新安装的用户拿到的就是它。拿它和 2026-08-20 那份对 6 万个随机公网
+      #   IPv4 逐个查，7.44% 判定不同，其中 1.6% 是「旧库判 CN、实际已不是 CN」——
+      #   那一档会被错误直连，是断网方向。
+      #   ★ 下载失败**当场判红**，与「Bundle latest stable core」同一个理由：
+      #   「包里带一份四年前的 GeoIP」是静默劣化，出货之后没有任何人看得见。
+      #   （存量用户不靠这一步 —— 四条线现在都有运行期的 GeoIP 自动更新。）
+      - name: Bundle latest GeoIP
+        shell: bash
+        run: |
+          PY=python3; command -v $PY >/dev/null 2>&1 || PY=python
+          "$PY" clashauto-c++/scripts/fetch_geoip.py
+
       - name: Resolve build version
         shell: bash
         run: |
@@ -2923,6 +2987,22 @@ jobs:
               echo "::error::macOS SDK $sdk < 26 —— Package.swift 的部署目标是 macOS 26，换带 Xcode 26+ 的 runner 镜像"
               exit 1;;
           esac
+
+      # ★★ 把四条线共用的 GeoIP 种子换成**最新**那份。**必须在构建之前** ——
+      #   Qt 走 qrc、Swift 走 Resources、Android 靠 gradle 把 `assets/bundle` 挂成
+      #   assets 源目录、iOS 靠 pbxproj 的拷贝阶段，全都是**构建时**读进去的。
+      #   ⚠️ 入库那份是 2022-09-08 的：它是个二进制，谁也不会想起来去更新它，
+      #   而全新安装的用户拿到的就是它。拿它和 2026-08-20 那份对 6 万个随机公网
+      #   IPv4 逐个查，7.44% 判定不同，其中 1.6% 是「旧库判 CN、实际已不是 CN」——
+      #   那一档会被错误直连，是断网方向。
+      #   ★ 下载失败**当场判红**，与「Bundle latest stable core」同一个理由：
+      #   「包里带一份四年前的 GeoIP」是静默劣化，出货之后没有任何人看得见。
+      #   （存量用户不靠这一步 —— 四条线现在都有运行期的 GeoIP 自动更新。）
+      - name: Bundle latest GeoIP
+        shell: bash
+        run: |
+          PY=python3; command -v $PY >/dev/null 2>&1 || PY=python
+          "$PY" clashauto-c++/scripts/fetch_geoip.py
 
       - name: Resolve build version
         id: ver
