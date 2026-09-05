@@ -706,6 +706,7 @@ jobs:
                            'COAST_MDNS_SELFTEST', 'COAST_PAIRPROTO_SELFTEST',
                            'COAST_PAIRSERVER_SELFTEST', 'COAST_ADVERTISE_SELFTEST',
                            'COAST_PAIRSESSION_SELFTEST', 'COAST_PAIRECDH_SELFTEST',
+                           'COAST_PAIRCLIENT_SELFTEST',
                            'COAST_QMLLOAD_SELFTEST', 'COAST_REMOTECLIENTS_SELFTEST',
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
@@ -1918,6 +1919,12 @@ jobs:
           # 共享密钥」——不成立的话「两边比对同一个码」的整套设计就塌了。
           # 另有一条挡 invalid-curve 攻击（不在曲线上的点必须被拒）。
           run_selftest COAST_PAIRECDH_SELFTEST
+          # 配对的**客户端**那一半（桌面也能扫一下就配上）：mDNS 浏览器解析 +
+          # 真起一个服务端把整条配对跑完（含逐个地址试、拒绝路径）。
+          # ★★ 最要紧的一条是「两边各自算出的 6 位码相同」—— 那是这套东西的全部
+          #   安全性，而它错了的表现只是"用户比对时发现不一样"，开发机上不会自己冒出来。
+          # ⚠️ 起不了服务端时（容器里没有可加组播的接口）明说 SKIP，与 PAIRSERVER 同。
+          run_selftest COAST_PAIRCLIENT_SELFTEST
           run_selftest COAST_TIDE_SELFTEST
           # 老模板迁移：它动的是**用户已经存在的**配置与台账。搬错一条 = 用户自己加的规则没了；
           # 漏改一处组名 = 规则指向不存在的组，核心拒绝**整份配置**，所有人的代理都起不来。
@@ -3163,6 +3170,7 @@ jobs:
                    COAST_YAMLNAME_SELFTEST COAST_SEEDMIGRATE_SELFTEST \
                    COAST_PATHS_SELFTEST COAST_PUBADDR_SELFTEST \
                    COAST_REMOTE_SELFTEST COAST_PAIRING_SELFTEST \
+                   COAST_PAIRCLIENT_SELFTEST \
                    COAST_ADVERTISE_SELFTEST COAST_TUNNELCTL_SELFTEST \
                    COAST_APPGROUP_SELFTEST; do
             run_hook "$t"
