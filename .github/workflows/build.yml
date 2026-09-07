@@ -708,6 +708,7 @@ jobs:
                            'COAST_PAIRSESSION_SELFTEST', 'COAST_PAIRECDH_SELFTEST',
                            'COAST_PAIRCLIENT_SELFTEST', 'COAST_REMOTEPROBE_SELFTEST',
                            'COAST_REMOTEPEERS_SELFTEST', 'COAST_REMOTEGEN_SELFTEST',
+                           'COAST_HOMENETS_SELFTEST',
                            'COAST_QMLLOAD_SELFTEST', 'COAST_REMOTECLIENTS_SELFTEST',
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
@@ -1938,6 +1939,10 @@ jobs:
           # 整份配置 = 代理整个起不来」：组成员引用不存在的名字、切换组指回 PROXY 成环、
           # 组名撞节点名；另有两条静默走偏（空订阅时生成组 = 连不上就直连）。
           run_selftest COAST_REMOTEGEN_SELFTEST
+          # 家中网段的校验与归一化（回家路由）。★★ 两个方向都要钉：把合法网段判掉 =
+          # 特性悄悄不生效；把非法网段放过去 = 它会被拼进 rules:，那是**核心拒绝整份
+          # 配置**（代理整个起不来）。纯逻辑、秒级、无网络。
+          run_selftest COAST_HOMENETS_SELFTEST
           run_selftest COAST_TIDE_SELFTEST
           # 老模板迁移：它动的是**用户已经存在的**配置与台账。搬错一条 = 用户自己加的规则没了；
           # 漏改一处组名 = 规则指向不存在的组，核心拒绝**整份配置**，所有人的代理都起不来。
