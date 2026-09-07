@@ -707,7 +707,7 @@ jobs:
                            'COAST_PAIRSERVER_SELFTEST', 'COAST_ADVERTISE_SELFTEST',
                            'COAST_PAIRSESSION_SELFTEST', 'COAST_PAIRECDH_SELFTEST',
                            'COAST_PAIRCLIENT_SELFTEST', 'COAST_REMOTEPROBE_SELFTEST',
-                           'COAST_REMOTEPEERS_SELFTEST',
+                           'COAST_REMOTEPEERS_SELFTEST', 'COAST_REMOTEGEN_SELFTEST',
                            'COAST_QMLLOAD_SELFTEST', 'COAST_REMOTECLIENTS_SELFTEST',
                            'COAST_LOGROUTE_SELFTEST',
                            'COAST_NICWIRING_SELFTEST', 'COAST_SOCKSUDPUSER_SELFTEST',
@@ -1934,6 +1934,10 @@ jobs:
           # 「我的电脑」台账：新字段的读写往返 + 老格式默认值 + pickServer 真值表。
           # ★ 纯逻辑、临时目录、秒级 —— 但它挡的三件事全都是「不报错，只是用起来不对」。
           run_selftest COAST_REMOTEPEERS_SELFTEST
+          # 「我的电脑」的「连不上时」生成：判据是**产物本身**。三条错了就是「核心拒绝
+          # 整份配置 = 代理整个起不来」：组成员引用不存在的名字、切换组指回 PROXY 成环、
+          # 组名撞节点名；另有两条静默走偏（空订阅时生成组 = 连不上就直连）。
+          run_selftest COAST_REMOTEGEN_SELFTEST
           run_selftest COAST_TIDE_SELFTEST
           # 老模板迁移：它动的是**用户已经存在的**配置与台账。搬错一条 = 用户自己加的规则没了；
           # 漏改一处组名 = 规则指向不存在的组，核心拒绝**整份配置**，所有人的代理都起不来。
