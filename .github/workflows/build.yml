@@ -721,7 +721,12 @@ jobs:
                            'COAST_CONFIRM_SELFTEST', 'COAST_RULEEXPLAIN_SELFTEST',
                            'COAST_CHANGELOG_SELFTEST', 'COAST_NODEHEALTH_SELFTEST',
                            'COAST_SCHEDULE_SELFTEST', 'COAST_SINGLEINSTANCE_SELFTEST',
-                           'COAST_ARPWATCH_SELFTEST')) {
+                           'COAST_ARPWATCH_SELFTEST',
+                           # 「局域网设备感知」的释放→重建。runner 上没装 Npcap，所以走的是
+                           # 「第二轮 configure 是否**仍然尝试**开端点」那套等价判据（open()
+                           # 失败会 emit deviceError，正是它的观测量）—— 不是跳过，见
+                           # LanSenseSelfTest.cpp 的文件头。
+                           'COAST_LANSENSE_SELFTEST')) {
             Set-Item "Env:\$t" '1'
             $out = Join-Path $env:RUNNER_TEMP "$t.out"
             # ★★ 用 WaitForExit(30000) 而不是 -Wait：钩子一旦没被注册（比如被裹进某个平台
@@ -1463,7 +1468,7 @@ jobs:
                    COAST_CONFIRM_SELFTEST COAST_RULEEXPLAIN_SELFTEST \
                    COAST_CHANGELOG_SELFTEST COAST_NODEHEALTH_SELFTEST \
                    COAST_SCHEDULE_SELFTEST COAST_SINGLEINSTANCE_SELFTEST \
-                   COAST_ARPWATCH_SELFTEST; do
+                   COAST_ARPWATCH_SELFTEST COAST_LANSENSE_SELFTEST; do
             run_hook "$t"
           done
 
@@ -1980,6 +1985,12 @@ jobs:
           # 冒充监测去抖表的上界：它的键含**攻击者可控**的 MAC，没上界时局域网里的人
           # 用随机 MAC 就能把网关拖死 —— 而这本是检测攻击的组件。
           run_selftest COAST_ARPWATCH_SELFTEST
+          # 「局域网设备感知」（默认关）的释放→重建：releaseIdle() 拆掉二层端点之后必须还能
+          # 再 configure 起来。断了的表现是「用户关掉感知后，给设备开代理再也起不来」，且零报错。
+          # 它抓不到什么，写在 LanSenseSelfTest.cpp 的文件头（m_torndown 那半不可观测）。
+          # runner 上非 root，AF_PACKET 开不了 —— 那时自检自动换成等价判据（第二轮是否仍然
+          # 尝试，以 deviceError 为凭据），不是跳过。全程不发帧、不投毒。
+          run_selftest COAST_LANSENSE_SELFTEST
           # ↓ core -t 复核。runner 上没有内核，所以这里验到的是 **fail-open 那条路**：
           #   判不了时必须 ran=false 且给得出原因，而不是悄悄 ok=true（那样用户会以为
           #   有核心把关，其实一次都没跑过）。"坏配置能被判出来"那半边要有内核才验得了，
