@@ -1,0 +1,310 @@
+name: Static Qt
+description: 取一套静态 Qt —— 命中缓存就复用，没命中就从源码编出来并回写缓存
+
+# 为什么需要这个 action：aqtinstall 只发共享构建的 Qt，官方从不提供静态二进制。
+# 「打包全用静态链接库」= 必须自己从源码编 Qt，每套配置 40–110 分钟。
+# 一次编好之后所有分支的推送都复用同一份缓存，正常推送不额外花时间。
+#
+# 缓存键含**本平台那份配方脚本**的哈希：改了配方（模块集、configure flag）会自动换键重编，
+# 不会出现「改了配方却复用了旧 Qt」——那种事本仓库在 Rust 静态库上踩过一次，
+# 表现是两边都绿而链的是上一版产物。只哈希本平台那一份（而不是整个目录）是有意的，
+# 理由见下面 Resolve paths 里的注释。
+
+inputs:
+  qt-version:
+    description: Qt 版本（须与 release.yml 的 QT_VERSION 一致）
+    required: true
+  target:
+    description: windows-x64 | windows-arm64 | linux-x64 | linux-arm64 | macos-universal
+    required: true
+  host-qt-path:
+    description: >-
+      交叉编译用的同版本宿主 Qt（仅 windows-arm64 需要）。**留空即可** ——
+      本 action 会自己取同版本同配方的 windows-x64 静态 Qt 当宿主（见 Host Qt 那一步）。
+      这个入参只是个逃生口：手上另有一份宿主 Qt 时可以顶掉自动解析。
+    required: false
+    default: ''
+  extra-cmake:
+    description: 追加给 configure 的 CMake 参数（如 macOS 的架构/部署目标）
+    required: false
+    default: ''
+  build-deadline-min:
+    description: >-
+      本轮最多花多少分钟编 Qt（Windows 断点续编用）。传 0 = **一个模块都不开**，
+      缓存没就绪就立刻失败。发布流水线该传 0：它的 run 会被下一次推送的并发组取消，
+      而取消掉的 job 跑不到回写缓存那一步 —— 边编边被取消 = 永远白烧。
+      真正的编译交给 Warm static Qt cache（那个 workflow 没有并发组，不会被顶掉）。
+    required: false
+    default: '280'
+
+outputs:
+  qt-root:
+    description: 静态 Qt 的安装前缀，直接喂给 -DCMAKE_PREFIX_PATH
+    value: ${{ steps.paths.outputs.prefix }}
+  cache-hit:
+    description: 是否命中缓存（未命中说明这次真的编了一遍）
+    value: ${{ steps.restore.outputs.cache-hit }}
+  prebuilt:
+    description: >-
+      是否直接用上了 ClashrAuto/qt-static 的预编产物。发布方拿它跳过「原样重传一遍」——
+      重传出来的包内容一样但字节不同（tar 时间戳），sha256 会变，等于让下游平白重下一次。
+    value: ${{ steps.prebuilt.outputs.hit }}
+  recipe:
+    description: 本平台配方脚本的短哈希，用于拼预编产物的资产名
+    value: ${{ steps.paths.outputs.recipe }}
+  complete:
+    description: 这一轮结束时这套 Qt 是否完整可用
+    value: ${{ steps.state.outputs.complete }}
+  host-qt-root:
+    description: >-
+      windows-arm64 交叉编译用的宿主 Qt 根目录（其它 target 为空）。调用方**也需要它** ——
+      app 自己的 arm64 构建同样要 -DQT_HOST_PATH，所以这里输出而不是藏在内部。
+    value: ${{ steps.hostqt.outputs.path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve paths
+      id: paths
+      shell: bash
+      run: |
+        set -euo pipefail
+        # 路径要**跨步骤稳定**且不含空格：缓存按绝对路径存取，Qt 的 .cmake 文件里也会
+        # 记死一部分绝对路径，换目录=缓存作废。
+        if [ "$RUNNER_OS" = "Windows" ]; then
+          prefix='C:/qtstatic'
+          src='C:/qtsrc'
+          recipe="$GITHUB_ACTION_PATH/build-windows.ps1"
+        else
+          prefix="$HOME/qtstatic"
+          src="$HOME/qtsrc"
+          recipe="$GITHUB_ACTION_PATH/build-posix.sh"
+        fi
+        echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+        echo "src=$src"       >> "$GITHUB_OUTPUT"
+        # ★ 缓存键只哈希**本平台那一份配方**，不哈希整个目录。
+        #   用 hashFiles('.github/actions/qt-static/**') 的话，改一行 Windows 脚本会把
+        #   Linux 与 macOS 已经编好的缓存一起作废 —— 那是白扔一个多小时的机时，而且
+        #   会诱使人「为了保住缓存而不敢改脚本」，正好把这个目录变成没人敢碰的地方。
+        # ★ macOS 上**没有 sha256sum**（那边叫 shasum -a 256）。第一版只写了 sha256sum，
+        #   而失败发生在命令替换 $(...) 里 —— echo 本身仍然成功，`set -e` 抓不到，
+        #   于是安静地产出一个**空哈希**。后果正是这个哈希本来要防的那件事：
+        #   资产名变成 qtstatic-6.8.3-macos-universal-.tar.gz，配方改了名字却不变，
+        #   下游继续下载旧 Qt。实测发生过一次，白发一个 264MB 的错名资产。
+        # ★ 两个都必须做，否则 Windows 这条腿永远拿不到预编产物：
+        #   · **从 stdin 喂**，不要把文件名交给 sha256sum。coreutils 遇到含反斜杠的文件名会
+        #     走转义输出：整行前面多一个 '\'。Windows runner 上 recipe 是
+        #     D:\a\clashauto\clashauto\./.github/... —— 于是 cut -c1-16 切出来的是
+        #     '\d12a05fef286f97'，正好被上面那道非空/十六进制断言拦下，Windows 两个 job
+        #     在 Resolve paths 就红。2026-08-08 实测发生过。
+        #   · **按 LF 归一**（tr -d '\r'）。Windows runner 的 checkout 是 CRLF，同一份配方
+        #     在 Windows 上算出的哈希与 Linux/macOS 不是一个值（实测 d12a05fe… vs 8ef3fa80…）。
+        #     哈希本来的意思是「配方的身份」，那就不该随 checkout 的换行风格变。POSIX 侧本来
+        #     就没有 \r，归一后哈希不变 —— 已经发布的 linux 资产继续有效。
+        if command -v sha256sum >/dev/null 2>&1; then
+          h="$(tr -d '\r' < "$recipe" | sha256sum | cut -c1-16)"
+        else
+          h="$(tr -d '\r' < "$recipe" | shasum -a 256 | cut -c1-16)"
+        fi
+        # 空哈希必须当场失败：它不会让任何一步报错，只会让「配方变了就换资产」这条保证失效。
+        case "$h" in
+          [0-9a-f][0-9a-f]*) ;;
+          *) echo "::error::算不出配方哈希（recipe=$recipe h='$h'）—— 资产名会失去配方绑定"; exit 1;;
+        esac
+        echo "recipe=$h" >> "$GITHUB_OUTPUT"
+
+    - name: Try prebuilt static Qt
+      id: prebuilt
+      shell: bash
+      run: |
+        set -uo pipefail
+        # ★★ 第一级：从 ClashrAuto/qt-static 取**预先编好**的产物。
+        #
+        #   为什么不用本仓库的 release：app 的更新列表读的是 /releases 全量，而
+        #   UpdateController::fetchReleases 取的是列表里第一个非 prerelease 的 release，
+        #   **不管它有没有可用资产** —— 一个 qt-static-6.8.3 的 tag 会被当成「最新版本」，
+        #   而它的 tag 不是版本号，版本比较会乱套。已经装出去的老客户端改不了，所以只能另立仓库。
+        #
+        #   相对 Actions 缓存的三个实打实的好处：
+        #     · 缓存**按分支隔离** —— 在功能分支上编好的，合并回 master 用不上，得重编一遍；
+        #     · 缓存 7 天不访问就淘汰，仓库总配额还只有 10 GB；
+        #     · 缓存**跨不了仓库** —— 外部签名仓库 schat.build 只能自己从头编。
+        #   换成公开仓库的 release 资产，这三条一起消失，而且下载不需要任何凭据。
+        #
+        #   取不到不是错误：下面还有缓存和源码构建两级兜底。仓库还没建、资产还没传、
+        #   配方刚改过（哈希变了）—— 都会走到这里，一律安静回退。
+        prefix='${{ steps.paths.outputs.prefix }}'
+        asset="qtstatic-${{ inputs.qt-version }}-${{ inputs.target }}-${{ steps.paths.outputs.recipe }}.tar.gz"
+        url="https://github.com/ClashrAuto/qt-static/releases/download/qt-${{ inputs.qt-version }}/$asset"
+        echo "找预编产物: $url"
+        # ★ 临时文件路径必须转成 POSIX 形式再交给 tar。Windows runner 上 RUNNER_TEMP 是
+        #   D:\a\_temp —— GNU tar 见到 `-f D:\a\_temp\x.tar.gz`，按 `host:path` 的老规矩
+        #   （冒号出现在第一个斜杠之前）判定这是**远程归档**，于是去连接名为 D 的主机：
+        #       tar (child): Cannot connect to D: resolve failed
+        #   资产已经下下来了，偏偏死在解压这一步，而上一行日志刚打印完正确的 URL，
+        #   看着极像"下载失败"。--force-local 能治，但那是 GNU 独有的 flag，
+        #   macOS 的 bsdtar 见了会直接报错 —— 这一段三个平台共用，所以改路径而不是加 flag。
+        tmp="$RUNNER_TEMP/qtstatic-prebuilt.tar.gz"
+        command -v cygpath >/dev/null 2>&1 && tmp="$(cygpath -u "$RUNNER_TEMP")/qtstatic-prebuilt.tar.gz"
+        # --speed-limit/--speed-time：涓流连接直接判死，别把这一级变成新的挂点。
+        if curl -fsSL --retry 3 --connect-timeout 20 --max-time 900 \
+                --speed-limit 10240 --speed-time 60 -o "$tmp" "$url"; then
+          mkdir -p "$prefix"
+          if tar -xzf "$tmp" -C "$prefix"; then
+            rm -f "$tmp"
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            # ★ 变量后面紧挨着全角括号时**必须加花括号**。macOS 自带的是 bash 3.2，
+            #   它的变量名扫描会把多字节字符的首字节也吃进名字里，于是 `$asset）`
+            #   被当成一个从未赋值的变量，set -u 当场毙掉整步：
+            #       line 37: asset<?>: unbound variable
+            #   这行埋了很久没炸，只是因为 mac 那边一直没有预编产物 —— 它从来没执行过。
+            echo "✅ 用上了预编静态 Qt（${asset}），跳过缓存与源码构建"
+            exit 0
+          fi
+          echo "::warning::预编产物解压失败，回退到缓存/源码构建"
+          rm -rf "$prefix"; rm -f "$tmp"
+        else
+          echo "没有预编产物（curl exit=$?），回退到缓存/源码构建"
+        fi
+        echo "hit=false" >> "$GITHUB_OUTPUT"
+
+    - name: Host Qt (windows-arm64 交叉编译用)
+      id: hostqt
+      if: inputs.target == 'windows-arm64'
+      shell: bash
+      run: |
+        set -euo pipefail
+        # ★★ 宿主 Qt 用**我们自己编的 windows-x64 静态 Qt**，不再用 aqtinstall。
+        #
+        #   不是偏好问题，是 aqt 装不了：Qt 从 6.9 起改了在线仓库的目录布局 ——
+        #       qt6_683/qt6_683/                    旧：一个目录装所有架构
+        #       qt6_6111/qt6_6111_msvc2022_64/      新：按架构分子目录
+        #   aqtinstall 3.3.0（PyPI 最新）仍按旧布局拼路径，装 6.11.x 一律报
+        #   "Failed to locate XML data for Qt version '6.11.1'"。抬到 6.11 之后，
+        #   原来那个 aqt 步骤在 windows-arm64 上是必挂的。
+        #
+        #   换成 x64 静态 Qt 没有任何将就：宿主要的是 moc/rcc/qmlcachegen/qsb 这些**编译期
+        #   可执行文件**，静态构建里一样齐全，而且版本天生对得上（同一个 tag、同一份配方）。
+        #   顺带省掉一次 aqt 下载和它那个"装不上不当场报、拖到三分钟后 Configure 才炸"的失败方式。
+        #
+        #   ★ 这一步**不看缓存命中与否**：就算这套 arm64 Qt 是从预编产物解出来的、一行都不用编，
+        #     调用方仍然需要宿主 Qt 去编 app 自己的 arm64 版本（-DQT_HOST_PATH）。
+        if [ -n '${{ inputs.host-qt-path }}' ]; then
+          echo "path=${{ inputs.host-qt-path }}" >> "$GITHUB_OUTPUT"
+          echo "用调用方指定的宿主 Qt: ${{ inputs.host-qt-path }}"
+          exit 0
+        fi
+        root='C:/qthost'
+        asset="qtstatic-${{ inputs.qt-version }}-windows-x64-${{ steps.paths.outputs.recipe }}.tar.gz"
+        url="https://github.com/ClashrAuto/qt-static/releases/download/qt-${{ inputs.qt-version }}/$asset"
+        echo "取宿主 Qt: $url"
+        # 同上：GNU tar 会把 D:\... 当成远程主机，路径先转 POSIX（见 Try prebuilt 那段注释）。
+        tmp="$RUNNER_TEMP/qthost.tar.gz"
+        command -v cygpath >/dev/null 2>&1 && tmp="$(cygpath -u "$RUNNER_TEMP")/qthost.tar.gz"
+        mkdir -p "$root"
+        if ! curl -fsSL --retry 3 --connect-timeout 20 --max-time 900 \
+                  --speed-limit 10240 --speed-time 60 -o "$tmp" "$url"; then
+          echo "::error::取不到宿主 Qt（${asset}）。arm64 是交叉编译，没有同版本宿主 Qt 就无从谈起。"
+          echo "::error::先把 windows-x64 那套编出来并发到 ClashrAuto/qt-static 的 qt-${{ inputs.qt-version }} 上。"
+          exit 1
+        fi
+        tar -xzf "$tmp" -C "$root"
+        rm -f "$tmp"
+        # 当场硬失败，别把「宿主 Qt 没就位」推给几分钟后的 configure 去背锅 —— 那边报出来的是
+        # "QT_HOST_PATH not set"，离真正的错因隔着一整段日志。
+        test -f "$root/bin/moc.exe" || { echo "::error::解出来的宿主 Qt 里没有 bin/moc.exe"; exit 1; }
+        echo "path=$root" >> "$GITHUB_OUTPUT"
+        echo "宿主 Qt: ${root}（= 同版本同配方的 windows-x64 静态 Qt）"
+
+    - name: Restore static Qt cache
+      id: restore
+      if: steps.prebuilt.outputs.hit != 'true'
+      uses: actions/cache/restore@v4
+      with:
+        path: ${{ steps.paths.outputs.prefix }}
+        # v1 是人工版本位：Qt 版本或配方之外的原因（比如换了 runner 镜像）需要作废缓存时改它。
+        key: qtstatic-v1-${{ inputs.qt-version }}-${{ inputs.target }}-${{ steps.paths.outputs.recipe }}
+        # ★ 退一步认**断点缓存**（-wip-N）。Windows 那套编不完 6 小时上限，只能分几轮推进：
+        #   每轮把已完成的模块存进 -wip-<已完成数>，下一轮按前缀取最新那份接着编。
+        #   注意 restore-keys 命中时 cache-hit 仍是 false —— 正是我们要的：文件恢复了，
+        #   构建步骤照样跑，脚本按 .done 标记跳过已完成的部分。
+        restore-keys: |
+          qtstatic-v1-${{ inputs.qt-version }}-${{ inputs.target }}-${{ steps.paths.outputs.recipe }}-wip-
+
+    - name: Build static Qt (POSIX)
+      if: steps.prebuilt.outputs.hit != 'true' && steps.restore.outputs.cache-hit != 'true' && runner.os != 'Windows'
+      shell: bash
+      env:
+        QT_VERSION: ${{ inputs.qt-version }}
+        QT_PREFIX: ${{ steps.paths.outputs.prefix }}
+        QT_SRC: ${{ steps.paths.outputs.src }}
+        QT_EXTRA_CMAKE: ${{ inputs.extra-cmake }}
+      run: bash "$GITHUB_ACTION_PATH/build-posix.sh"
+
+    - name: Build static Qt (Windows)
+      if: steps.prebuilt.outputs.hit != 'true' && steps.restore.outputs.cache-hit != 'true' && runner.os == 'Windows'
+      shell: pwsh
+      env:
+        QT_VERSION: ${{ inputs.qt-version }}
+        QT_PREFIX: ${{ steps.paths.outputs.prefix }}
+        QT_SRC: ${{ steps.paths.outputs.src }}
+        QT_ARCH: ${{ endsWith(inputs.target, 'arm64') && 'arm64' || 'x64' }}
+        QT_HOST_PATH: ${{ steps.hostqt.outputs.path }}
+        QT_BUILD_DEADLINE_MIN: ${{ inputs.build-deadline-min }}
+      run: pwsh -File "$env:GITHUB_ACTION_PATH/build-windows.ps1"
+
+    - name: Inspect build state
+      id: state
+      if: always()
+      shell: bash
+      run: |
+        set -uo pipefail
+        prefix='${{ steps.paths.outputs.prefix }}'
+        # POSIX 那两套一次就能编完，脚本不落标记 —— 一律当作已完成，行为与加断点续编之前一致。
+        if [ "$RUNNER_OS" != "Windows" ]; then
+          echo "complete=true" >> "$GITHUB_OUTPUT"; echo "done=0" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+        # 预编产物是从**完整**前缀打的包，里面就带着 .qtstatic-complete；这里显式再认一次，
+        # 免得将来谁改了打包方式（比如漏掉点文件）时，一份好 Qt 被判成"没编完"又去重编。
+        if [ "${{ steps.prebuilt.outputs.hit }}" = "true" ] \
+           || [ "${{ steps.restore.outputs.cache-hit }}" = "true" ] || [ -f "$prefix/.qtstatic-complete" ]; then
+          echo "complete=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "complete=false" >> "$GITHUB_OUTPUT"
+        fi
+        n=$(ls -1 "$prefix"/.qtstatic-*.done 2>/dev/null | wc -l | tr -d ' ')
+        echo "done=$n" >> "$GITHUB_OUTPUT"
+        echo "断点状态: 已完成模块=$n  complete=$( [ -f "$prefix/.qtstatic-complete" ] && echo yes || echo no )"
+
+    - name: Save static Qt cache
+      # 只在**真的编完**时回写最终键。用 cache/save 而不是 cache 的 post 步骤：composite action 里
+      # 显式两段更好读，也免得构建失败时把半份 Qt 存进缓存 —— 那会毒化后续所有构建，
+      # 且表现为"缓存命中但编不过"，比重编一次难查得多。
+      if: steps.prebuilt.outputs.hit != 'true' && steps.restore.outputs.cache-hit != 'true' && steps.state.outputs.complete == 'true' && success()
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.paths.outputs.prefix }}
+        key: qtstatic-v1-${{ inputs.qt-version }}-${{ inputs.target }}-${{ steps.paths.outputs.recipe }}
+
+    - name: Save static Qt progress cache
+      # 没编完就把**进度**存起来，键里带已完成模块数。用「模块数」而不是 run_id 做后缀，
+      # 是为了把条目数**钉死在模块数量级**（每套最多 4 条）——用 run_id 的话每跑一轮多一条，
+      # 几 GB 的半份 Qt 很快会把 10GB 仓库配额挤爆，进而把 Linux/macOS 那两份好缓存挤掉。
+      if: always() && steps.prebuilt.outputs.hit != 'true' && runner.os == 'Windows' && steps.state.outputs.complete != 'true' && steps.state.outputs.done != '0'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ steps.paths.outputs.prefix }}
+        key: qtstatic-v1-${{ inputs.qt-version }}-${{ inputs.target }}-${{ steps.paths.outputs.recipe }}-wip-${{ steps.state.outputs.done }}
+
+    - name: Report
+      shell: bash
+      run: |
+        echo "静态 Qt: ${{ steps.paths.outputs.prefix }} (cache-hit=${{ steps.restore.outputs.cache-hit }}, complete=${{ steps.state.outputs.complete }})"
+        if [ "${{ steps.state.outputs.complete }}" != "true" ]; then
+          echo "::error::静态 Qt 这套配置还没编完（已完成 ${{ steps.state.outputs.done }} 个模块，进度已存进断点缓存）。"
+          echo "::error::再跑一次 Warm static Qt cache 就从断点接着编；编完之后本 job 会秒级命中。"
+          echo "::error::★ 现在**当场失败**是有意的：以前这里会一路跑到 6 小时上限被掐，"
+          echo "::error::  两个 Windows runner 各烧 6 小时、manifest job 被 skip、version.json 因此不动。"
+          exit 1
+        fi
+        test -d "${{ steps.paths.outputs.prefix }}/lib" || { echo "::error::静态 Qt 前缀不存在或不完整"; exit 1; }
