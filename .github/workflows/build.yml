@@ -946,6 +946,40 @@ jobs:
             exit 1
           }
 
+      # 命令行（`coast <命令>` / `coast --headless`）：纯函数 + 传输层 + **真起一个无头子进程**、
+      # 用真客户端打它（验的是接线：端点起没起、方法表装没装、各方法走没走到真控制器）。
+      # ★ Windows 这条腿尤其要跑：端点是**命名管道**，与 POSIX 的 unix socket 两套实现；
+      #   而 Coast.exe 是 GUI 子系统，命令行那条路要自己挂父进程的控制台。
+      # ★ 放在「Bundle latest stable core」之后：给了内核（COAST_TEST_CORE），配对与远程接入
+      #   那几条才验得到真凭据那条路（不给就 SKIP 那几条，其余照测）。内核只用来生成凭据，
+      #   不起它。它自己在沙箱里跑（COAST_DATA_DIR / USERNAME / 现挑端口），不用外面再包一层。
+      - name: Command-line self-test (headless daemon + coast <command>)
+        if: matrix.arch == 'x64'
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:BUILD_DIR "Release\Coast.exe"
+          $env:COAST_TEST_CORE = Join-Path $env:STAGE_DIR "core.exe"
+          $env:COAST_CLI_SELFTEST = "1"
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $p = Start-Process -FilePath $exe -PassThru -NoNewWindow `
+                 -RedirectStandardOutput "$env:RUNNER_TEMP\cli.log" `
+                 -RedirectStandardError "$env:RUNNER_TEMP\cli.err"
+          $null = $p.Handle   # 不先取句柄的话，退出后 ExitCode 读出来是空的
+          if (-not $p.WaitForExit(180000)) {
+            $p.Kill()
+            Get-Content "$env:RUNNER_TEMP\cli.log" -EA SilentlyContinue | ForEach-Object { "      $_" }
+            Write-Host "::error::COAST_CLI_SELFTEST 180 秒未退出（不是断言失败）"
+            exit 1
+          }
+          $out = Get-Content "$env:RUNNER_TEMP\cli.log" -EA SilentlyContinue
+          $out | ForEach-Object { "      $_" }
+          if ($p.ExitCode -ne 0) {
+            $out | Select-String -Pattern 'FAIL|===' | Select-Object -Last 8 |
+              ForEach-Object { Write-Host ("::error::CLI | " + $_.ToString()) }
+            Write-Host "::error::COAST_CLI_SELFTEST 失败（exit=$($p.ExitCode)）"
+            exit 1
+          }
+
       - name: Create portable zip
         shell: pwsh
         run: |
@@ -1501,6 +1535,38 @@ jobs:
             -output "$BUILD_DIR/Coast.app/Contents/Resources/core"
           chmod 755 "$BUILD_DIR/Coast.app/Contents/Resources/core"
           lipo -archs "$BUILD_DIR/Coast.app/Contents/Resources/core"
+
+      # 命令行（`coast <命令>` / `coast --headless`）：纯函数 + 传输层 + **真起一个无头子进程**、
+      # 用真客户端打它。mac 这条腿多验一样：`--headless` 必须跳过「搬进 /Applications」那个
+      # 模态框（无头时没人能点它，会一直挂着）—— 子进程跑的正是构建目录里的 Coast.app。
+      # ★ 不能用 `timeout`（GNU coreutils，macOS 没有）：与上面 run_hook 同一个自建看门狗。
+      # ★ 放在集成内核之后：给了 COAST_TEST_CORE，配对与远程接入那几条才验得到真凭据。
+      - name: Command-line self-test (headless daemon + coast <command>)
+        shell: bash
+        run: |
+          bin="$BUILD_DIR/Coast.app/Contents/MacOS/Coast"
+          out="$RUNNER_TEMP/cli-selftest.out"
+          env QT_QPA_PLATFORM=offscreen COAST_CLI_SELFTEST=1 \
+              COAST_TEST_CORE="$BUILD_DIR/Coast.app/Contents/Resources/core" "$bin" >"$out" 2>&1 &
+          pid=$!
+          for i in $(seq 1 360); do
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 0.5
+          done
+          if kill -0 "$pid" 2>/dev/null; then
+            kill -9 "$pid" 2>/dev/null || true
+            sed 's/^/      /' "$out" || true
+            echo "::error::COAST_CLI_SELFTEST 180 秒未退出（不是断言失败）"
+            exit 1
+          fi
+          rc=0; wait "$pid" || rc=$?
+          sed 's/^/      /' "$out" || true
+          if [ "$rc" != 0 ]; then
+            { grep -E 'FAIL|===' "$out" | tail -n 8 || true; } |
+              while IFS= read -r l; do echo "::error::CLI | ${l}"; done
+            echo "::error::COAST_CLI_SELFTEST 失败（exit=${rc}）"
+            exit 1
+          fi
 
       # 导入 Developer ID 证书到临时 keychain（仅当设置了 secret；否则回退 ad-hoc，fork 仍能编）。
       # 复用 schat.build/qt-desktop.yml 的做法，凭据同名 secret（Team 6AXTRT5TV4）。
@@ -2174,6 +2240,29 @@ jobs:
             printf '%s\n' "$out" | grep -E '^(FAIL|SKIP|===)' | tail -n 6 |
               while IFS= read -r l; do echo "::error::REMOTELISTEN | $l"; done
             echo "::error::COAST_REMOTELISTEN_SELFTEST 失败（exit=${rc}）"
+            exit 1
+          fi
+
+      # 命令行（`coast <命令>` / `coast --headless`）：纯函数 + 传输层 + **真起一个无头子进程**、
+      # 用真客户端打它。Linux 是这个功能的主场（服务器 / systemd），这条腿还额外验
+      # 「SIGTERM → 实例正常退出」（systemctl stop 走的就是它）。
+      # ★ 给了内核（COAST_TEST_CORE）配对与远程接入那几条才验得到真凭据那条路；
+      #   内核只用来生成凭据，不起它。沙箱它自己建（COAST_DATA_DIR / TMPDIR / 现挑端口）。
+      - name: Command-line self-test (headless daemon + coast <command>)
+        shell: bash
+        run: |
+          rc=0
+          out="$(COAST_TEST_CORE="$STAGE_DIR/core" COAST_CLI_SELFTEST=1 QT_QPA_PLATFORM=offscreen \
+                 timeout 180 "$BUILD_DIR/coast" 2>&1)" || rc=$?
+          printf '%s\n' "$out" | sed 's/^/      /'
+          if [ "$rc" = 124 ]; then
+            echo "::error::COAST_CLI_SELFTEST 180 秒未退出（不是断言失败）"
+            exit 1
+          fi
+          if [ "$rc" != 0 ]; then
+            { printf '%s\n' "$out" | grep -E 'FAIL|===' | tail -n 8 || true; } |
+              while IFS= read -r l; do echo "::error::CLI | $l"; done
+            echo "::error::COAST_CLI_SELFTEST 失败（exit=${rc}）"
             exit 1
           fi
 
